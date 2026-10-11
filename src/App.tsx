@@ -54,12 +54,7 @@ import {
 } from "@/utils/errorUtils";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { deepClone } from "@/utils/deepClone";
-import {
-  isLinux,
-  isMac,
-  isTauriRuntime,
-  isWindows,
-} from "@/lib/platform";
+import { isLinux, isMac, isTauriRuntime, isWindows } from "@/lib/platform";
 import {
   APP_STORAGE_KEY,
   appPageBelongsTo,

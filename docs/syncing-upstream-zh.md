@@ -89,7 +89,19 @@ git merge --abort                             # 看完撤销
 
 ## 合并后必须验证
 
-顺序与 CI 的 `server` job 一致：
+**两边都跑，一条都别省**——2026-10-11 那次合并就是因为只跑了 `cargo check` 和前端的部分命令，
+漏掉 `cargo test` 与 `pnpm format:check`，推上去才发现三个平台的 `Run tests` 和
+`Frontend Checks → Check formatting` 全红（前者是移植改动导致一个上游测试断言失败，
+后者是手写的 import 不符合 prettier）。
+
+前端 + 桌面（对应 CI 的 `frontend` / `backend` job）：
+
+```bash
+pnpm typecheck && pnpm format:check && pnpm test:unit
+cd src-tauri && cargo fmt --check && cargo clippy -- -D warnings && cargo test
+```
+
+服务端（对应 CI 的 `server` job）：
 
 ```bash
 pnpm build:web
@@ -98,7 +110,14 @@ cargo build  --manifest-path src-tauri/Cargo.toml --no-default-features --featur
 bash scripts/e2e/run-all.sh
 ```
 
-（`CONTRIBUTING.md` 里也列了这几条。）
+两点经验：
+
+- `cargo clippy` / `cargo check` **不编译 `#[cfg(test)]` 代码**。移植改动破坏了测试断言时，
+  只有 `cargo test` 会告诉你（还可能连锁：`--lib` 挂了后面 15 个集成测试目标根本不会跑，
+  所以看到 "test failed" 要确认每个 target 都出过 `test result:` 行）。
+- 手写的 import / 多行表达式过一遍 `pnpm format:check`，别等 CI。
+
+（`CONTRIBUTING.md` 里也列了这些。）
 
 ## 合并完更新基线
 

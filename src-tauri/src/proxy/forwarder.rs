@@ -6269,8 +6269,10 @@ mod tests {
                 Ok(_) => panic!("expected local validation failure: {body}"),
             };
             if body["model"] == "gpt-5.5" {
+                // fork 的 `resolve_codex_copilot_model` 不经过 AppHandle，而是查
+                // oauth_registry——文案随之改成 "CopilotAuthManager unavailable"。
                 assert!(matches!(&error, ProxyError::ConfigError(message)
-                    if message.contains("AppHandle") && message.contains("gpt-5.5")));
+                    if message.contains("CopilotAuthManager") && message.contains("gpt-5.5")));
                 assert_eq!(
                     forwarder.categorize_proxy_error(&error, &copilot),
                     ErrorCategory::Retryable
