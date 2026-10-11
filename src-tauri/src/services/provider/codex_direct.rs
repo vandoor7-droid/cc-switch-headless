@@ -36,8 +36,8 @@ use crate::live::patch::toml::{value_text, TomlDocPatch, TomlSteps};
 use crate::live::patch::{Guarded, LivePatch, WholeFile};
 use crate::live::project::codex::{
     official_mirror_table, proxy_route_table, requires_openai_auth, row_catalog_pointer,
-    CodexConfigPatch, CodexProjection, KnownTable, Route, RouteAuth, RouteWrite, RowInput,
-    ROUTE_ID, WEB_SEARCH_DISABLED,
+    without_row_catalog, CodexConfigPatch, CodexProjection, KnownTable, Route, RouteAuth,
+    RouteWrite, RowInput, ROUTE_ID, WEB_SEARCH_DISABLED,
 };
 use crate::mode::contract::CONTRACT_VERSION;
 use crate::mode::operation::{AppWrite, FileChange, OperationReport};
@@ -50,7 +50,7 @@ use crate::services::subscription::CodexKeychainLogin;
 use std::sync::Arc;
 
 use super::codex_login::{self, AuthInput, AuthPlan, AuthTarget, LoginStash, STASH_FILENAME};
-use super::codex_official_models::{self, NativeRows, OfficialLogin};
+use super::codex_official_models::{self, NativeRows, OfficialLogin, OfficialSkip};
 use super::ProviderService;
 
 fn app() -> &'static str {
@@ -229,7 +229,7 @@ pub(crate) async fn prepare_official_rows(
         prepared.keychain = Some(off_runtime(codex_official_models::keychain_login).await?);
     }
     let login = predicted_official_login(db, owner, target, prepared)?;
-    let rows = off_runtime(move || codex_official_models::rows_for_switch(login.as_ref())).await?;
+    let rows = off_runtime(move || codex_official_models::rows_for_switch(&login)).await?;
     // 取官方行最多要 10 秒，这期间 Codex 可能在钥匙串里换了号。取完再读一次，拿锁后按
     // 这次读到的核对（见 `run_with_edits`），换了号就停下。
     if rows.identity().is_some() && prepared.keychain.is_some() {
@@ -253,21 +253,27 @@ pub(crate) fn needs_official_rows(route: &Provider, stack: &[Member]) -> bool {
     !stack.is_empty() && is_official(route)
 }
 
-/// 按未加锁读到的内容预测这次操作之后 Codex 会用的登录（能取官方列表的才返回）。钥匙串
-/// 没预先读过（[`prepare_official_rows`] 之外的调用方）就在用到时读，调用方要在阻塞线程里。
+/// 按未加锁读到的内容预测这次操作之后 Codex 会用的登录（能取官方列表的才是 `Ok`，否则带
+/// 着取不到的原因）。钥匙串没预先读过（[`prepare_official_rows`] 之外的调用方）就在用到时
+/// 读，调用方要在阻塞线程里。
 pub(crate) fn predicted_official_login(
     db: &Database,
     owner: &Owner<'_>,
     target: &Target<'_>,
     prepared: &Prepared,
-) -> Result<Option<OfficialLogin>, AppError> {
+) -> Result<Result<OfficialLogin, OfficialSkip>, AppError> {
     // 先按没有官方行算一遍，拿到这次对 auth.json 的去向（目录在第二遍才算）。
     let planned = plan(db, owner, target, prepared)?;
     let live = read_current(&get_codex_auth_path())
         .ok()
         .flatten()
         .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null));
-    let stash = load_stash(&DeviceStore::for_device(), &planned.official_logins).stash;
+    let stash = load_stash(
+        &DeviceStore::for_device(),
+        &planned.official_logins,
+        live.as_ref(),
+    )
+    .stash;
     let auth_plan = codex_login::plan(AuthInput {
         live: live.as_ref(),
         live_is_managed: live_is_managed(prepared, live.as_ref()),
@@ -284,8 +290,8 @@ pub(crate) fn predicted_official_login(
     };
     Ok(
         login_after(&auth_plan, live.as_ref(), &read_config_text(), keychain)
-            .as_ref()
-            .and_then(OfficialLogin::of),
+            .ok_or(OfficialSkip::NoLogin)
+            .and_then(|auth| OfficialLogin::of(&auth)),
     )
 }
 
@@ -387,15 +393,11 @@ fn exclusive_of(provider: &Provider, projection: &CodexProjection) -> Vec<(Strin
     exclusive
 }
 
-/// live 现在对应的那一家带进来的独有字段和行里指定的模型目录指针：切走时值还相同就删。
+/// live 现在对应的那一家带进来的独有字段：切走时值还相同就删。
 pub(crate) fn outgoing_exclusive(owner: &Owner<'_>) -> Vec<(String, TomlValue)> {
     match owner {
         Owner::Provider(provider) => match project(provider) {
-            Ok(projection) => {
-                let mut fields = exclusive_of(provider, &projection);
-                fields.extend(row_catalog_pointer(&projection.top).cloned());
-                fields
-            }
+            Ok(projection) => exclusive_of(provider, &projection),
             Err(err) => {
                 log::warn!(
                     "无法投影 Codex 供应商 {} 的独有字段，切走时不清理它们: {err}",
@@ -702,6 +704,16 @@ pub(crate) fn route_owns_catalog(route: &Provider) -> bool {
     project(route).is_ok_and(|projection| row_catalog_pointer(&projection.top).is_some())
 }
 
+/// 去掉路由那家行里自己指定的模型目录指针之后的 `settings_config`；行里没有时为 `None`。
+pub(crate) fn settings_without_row_catalog(route: &Provider) -> Option<Value> {
+    let text = without_row_catalog(route.settings_config.get("config")?.as_str()?)?;
+    let mut settings = route.settings_config.clone();
+    settings
+        .as_object_mut()?
+        .insert("config".to_string(), Value::String(text));
+    Some(settings)
+}
+
 /// 发布了 Stack 模型时不写进 `config.toml` 的全局键：Codex 拿它们覆盖目录里的每一行。
 const STACK_SUNK_WINDOW_KEYS: &[&str] = &["model_context_window", "model_auto_compact_token_limit"];
 
@@ -779,7 +791,12 @@ fn stack_catalog(
             },
         })
         .collect();
-    plan_codex_stack_catalog(route_row, &members).map(Some)
+    plan_codex_stack_catalog(
+        route_row,
+        &members,
+        crate::settings::codex_stack_classic_subagents(),
+    )
+    .map(Some)
 }
 
 fn table_text(table: &Table) -> String {
@@ -853,13 +870,12 @@ fn contract_of(
         exclusive: config
             .exclusive
             .iter()
-            .chain(row_catalog_pointer(&config.top))
             .map(|(key, value)| (key.clone(), Value::String(value_text(value))))
             .collect(),
     }
 }
 
-/// 读登录暂存。
+/// 读到的登录暂存。
 struct LoadedStash {
     stash: LoginStash,
     pre: Option<Vec<u8>>,
@@ -868,17 +884,12 @@ struct LoadedStash {
     unreadable: Option<String>,
 }
 
-fn load_stash(store: &DeviceStore, official_logins: &[Value]) -> LoadedStash {
+/// 读登录暂存。`live` 是现在的 `auth.json`：升级更早版本的暂存时要用（见 `LoginStash::loaded`）。
+fn load_stash(store: &DeviceStore, official_logins: &[Value], live: Option<&Value>) -> LoadedStash {
     let path = store.file(STASH_FILENAME);
     let pre = read_current(&path).ok().flatten();
     let (stash, unreadable) = match pre.as_deref().map(serde_json::from_slice::<LoginStash>) {
-        Some(Ok(stash)) => (
-            LoginStash {
-                initialized: true,
-                ..stash
-            },
-            None,
-        ),
+        Some(Ok(stash)) => (stash.loaded(official_logins, live), None),
         Some(Err(err)) => {
             log::warn!("Codex 登录暂存 {} 无法解析: {err}", path.display());
             (
@@ -958,7 +969,7 @@ pub(crate) fn run_with_edits(
         stash,
         pre: stash_pre,
         unreadable: stash_unreadable,
-    } = load_stash(store, &planned.official_logins);
+    } = load_stash(store, &planned.official_logins, live_auth.as_ref());
     let preserve = crate::settings::preserve_codex_official_auth_on_switch();
     let auth_plan = codex_login::plan(AuthInput {
         live: live_auth.as_ref(),
@@ -980,8 +991,7 @@ pub(crate) fn run_with_edits(
                 .unwrap_or(CodexKeychainLogin::Unknown)
         };
         let actual = login_after(&auth_plan, live_auth.as_ref(), &config_text, keychain)
-            .as_ref()
-            .and_then(OfficialLogin::of)
+            .and_then(|auth| OfficialLogin::of(&auth).ok())
             .map(|login| login.identity);
         if actual.as_deref() != Some(expected.as_str()) {
             return Err(AppError::localized(

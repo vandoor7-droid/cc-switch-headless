@@ -4,7 +4,7 @@
 上游会持续加新供应商预设、新 CLI 支持、修代理和会话解析的 bug。这份文档是怎么把它们
 合进来、以及合并时要注意什么。
 
-基线记录在 [`upstream-v4.0.0.lock`](upstream-v4.0.0.lock)：那个文件里的
+基线记录在 [`upstream-v4.0.8.lock`](upstream-v4.0.8.lock)：那个文件里的
 `last_merged_commit` 就是「这个 fork 跟到上游哪里」。
 
 ## 一次性配置
@@ -102,10 +102,10 @@ bash scripts/e2e/run-all.sh
 
 ## 合并完更新基线
 
-把 `docs/upstream-v4.0.0.lock` 改名成新的基线并更新内容，例如合到上游 `v4.1.0` 之后：
+把 `docs/upstream-v4.0.8.lock` 改名成新的基线并更新内容，例如合到上游 `v4.1.0` 之后：
 
 ```bash
-git mv docs/upstream-v4.0.0.lock docs/upstream-v4.1.0.lock
+git mv docs/upstream-v4.0.8.lock docs/upstream-v4.1.0.lock
 # 改 upstream_tag / upstream_commit / last_merged_commit / resolved_at
 ```
 

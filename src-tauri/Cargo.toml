@@ -1,6 +1,6 @@
 [package]
 name = "cc-switch"
-version = "4.0.0"
+version = "4.0.8"
 description = "Headless web server mode for CC Switch: manage AI CLI providers, routing and sessions from a browser."
 authors = ["Jason Young"]
 license = "MIT"
@@ -33,6 +33,7 @@ desktop = [
     "dep:tauri-plugin-window-state",
     "dep:tauri-plugin-single-instance",
     "dep:webkit2gtk",
+    "dep:gtk",
     "dep:arboard",
 ]
 server = ["dep:env_logger", "dep:rust-embed", "dep:mime_guess"]
@@ -133,6 +134,9 @@ tauri-plugin-single-instance = { version = "2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2.0.1", features = ["v2_16"], optional = true }
+# 上游新加的：只有 linux_fix.rs（#[cfg(all(target_os = "linux", feature = "desktop"))]）
+# 用它。跟着 webkit2gtk 一起设成 optional，server 构建才不会又要求装 GTK 开发包。
+gtk = { version = "0.18", optional = true }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 libc = "0.2"
@@ -140,8 +144,10 @@ libc = "0.2"
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
 windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
 
@@ -154,7 +160,9 @@ objc2-app-kit = { version = "0.2", features = ["NSColor"] }
 
 # Optimize release binary size to help reduce AppImage footprint
 [profile.release]
-codegen-units = 1
+# 主 crate 体量大，codegen-units = 1 时 LLVM 只能单线程跑，发布编译的大头都在它身上。
+# 16 让主 crate 编译快约 64%，代价是二进制体积增加约 17%（10-05 本机基准）。
+codegen-units = 16
 lto = "thin"
 opt-level = "s"
 # 使用 unwind 以便 panic hook 能捕获 backtrace（abort 会直接终止无法捕获）
