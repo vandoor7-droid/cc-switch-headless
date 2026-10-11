@@ -45,6 +45,36 @@ git merge upstream/main
   merge 只解一次；
 - 历史本来就是 merge 出来的（`git log --merges`）。
 
+## 实测：一次合并要解多少冲突
+
+2026-10-11 干跑过一次（`git merge --no-commit --no-ff upstream/main`，上游停在 **v4.0.8**，
+本 fork 落后 147 个提交、上游侧改了 479 个文件）：
+
+**只有 10 个文件冲突、合计 15 处**，其余 469 个文件自动合并。
+
+| 冲突处数 | 文件 |
+| --- | --- |
+| 3 | `.github/workflows/release.yml` |
+| 2 | `src-tauri/src/proxy/forwarder.rs` |
+| 2 | `src-tauri/Cargo.toml` |
+| 2 | `README.md` |
+| 1 | `.github/workflows/ci.yml` |
+| 1 | `package.json` |
+| 1 | `src-tauri/src/lib.rs` |
+| 1 | `src-tauri/src/commands/import_export.rs` |
+| 1 | `src-tauri/src/services/provider/codex_official_models.rs` |
+| 1 | `src/App.tsx` |
+
+都是「两边都改了同一处」的机械冲突（fork 的 `#[cfg]` 门 / workflow 触发条件 / 文档与版本号），
+没有需要重新设计的。**想看当前会冲突什么，自己干跑一次即可**：
+
+```bash
+git fetch upstream
+git merge --no-commit --no-ff upstream/main   # 在同步分支上
+git diff --name-only --diff-filter=U          # 冲突文件
+git merge --abort                             # 看完撤销
+```
+
 ## 冲突高发区
 
 | 类别 | 文件 | 说明 |
