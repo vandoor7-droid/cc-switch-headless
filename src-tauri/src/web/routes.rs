@@ -325,6 +325,25 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("delete_env_vars", delete_env_vars as Handler);
         table.insert("restore_env_backup", restore_env_backup as Handler);
 
+        // ---- Codex 会话压缩 / 过期提示 / 日志 ----
+        table.insert(
+            "get_codex_session_compression",
+            get_codex_session_compression as Handler,
+        );
+        table.insert(
+            "set_codex_session_compression",
+            set_codex_session_compression as Handler,
+        );
+        table.insert(
+            "get_codex_sessions_disk_usage",
+            get_codex_sessions_disk_usage as Handler,
+        );
+        table.insert(
+            "acknowledge_codex_stale_clients",
+            acknowledge_codex_stale_clients as Handler,
+        );
+        table.insert("reveal_app_log_file", reveal_app_log_file as Handler);
+
         // ---- Pi 状态 / 用量脚本 / 用量首日 ----
         table.insert("get_pi_current_state", get_pi_current_state as Handler);
         table.insert(
@@ -1871,6 +1890,72 @@ fn get_usage_first_date(context: Arc<Context>, args: Value) -> HandlerFuture {
         })
         .await
         .and_then(serializable)
+    })
+}
+
+// ============================================================================
+// Codex 会话压缩 / 过期客户端提示 / 日志文件
+// ============================================================================
+
+/// Codex 会话压缩开关（`[features] local_thread_store_compression`）当前是否开启。
+fn get_codex_session_compression(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let enabled =
+            crate::services::codex_session_compression::is_enabled().map_err(|e| e.to_string())?;
+        serializable(enabled)
+    })
+}
+
+/// 开关 Codex 会话压缩，返回写入后的状态。
+fn set_codex_session_compression(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            enabled: bool,
+        }
+        let Args { enabled } = parse(args)?;
+        let state = context.require_state()?;
+        // 桌面命令把这一步丢进阻塞线程池（它改 Codex 的配置文件），照此办理
+        blocking(move || {
+            crate::services::codex_session_compression::set_enabled(&state.db, enabled)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .and_then(serializable)
+    })
+}
+
+/// Codex 会话目录（sessions + archived_sessions）当前占用的字节数。
+fn get_codex_sessions_disk_usage(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    // 目录扫描是同步 IO，丢进阻塞线程池；`deferred` 就是「阻塞 + 序列化」这条
+    // 组合，顺带把裸 `u64` 包成 `Ok`
+    deferred(|| Ok(crate::services::codex_session_compression::sessions_disk_usage()))
+}
+
+/// 用户关掉「Codex 可能还在用旧的」提示：记下当前目录与文件登录，同一份不再提示。
+fn acknowledge_codex_stale_clients(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        // `acknowledge` 返回 `()`，别把它绑给变量（clippy 的 `let_unit_value`）；
+        // 它要做的事在闭包里：把当前目录与文件登录记进设备存档
+        crate::services::provider::codex_direct::off_runtime(|| {
+            crate::services::provider::codex_client_catalog::acknowledge(
+                &crate::live::engine::DeviceStore::for_device(),
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(Value::Bool(true))
+    })
+}
+
+/// 服务端没有桌面会话，替不了**用户**在文件管理器里定位日志文件。
+///
+/// 与 `open_config_folder` 同一条约定：这类动作在 web 模式下返回描述性错误，
+/// 而不是 `E_NOT_IMPLEMENTED` —— 前者能直接告诉用户去哪里找，后者只是「没有
+/// 这个命令」。日志就在 `<配置目录>/logs/cc-switch.log`。
+fn reveal_app_log_file(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        Err("Web 模式下请在服务器上直接打开 <配置目录>/logs/cc-switch.log".to_string())
     })
 }
 
