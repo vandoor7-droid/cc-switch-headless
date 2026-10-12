@@ -1,60 +1,12 @@
 //! 项目 Profile 管理命令
 
-use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 
 use crate::app_config::AppType;
-use crate::database::Profile;
-use crate::services::profile::{ProfilePayload, ProfileScope, ProfileService};
+use crate::services::profile::{ProfileScope, ProfileService};
 use crate::store::AppState;
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProfileDto {
-    pub id: String,
-    pub name: String,
-    pub payload: ProfilePayload,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<i64>,
-}
-
-impl From<Profile> for ProfileDto {
-    fn from(profile: Profile) -> Self {
-        // 单条 payload 损坏不应拖垮整个列表：降级为默认值并记日志
-        let payload = serde_json::from_str(&profile.payload).unwrap_or_else(|e| {
-            log::warn!(
-                "解析 profile '{}' payload 失败，使用默认值: {e}",
-                profile.id
-            );
-            ProfilePayload::default()
-        });
-        Self {
-            id: profile.id,
-            name: profile.name,
-            payload,
-            created_at: profile.created_at,
-            updated_at: profile.updated_at,
-        }
-    }
-}
-
-/// 每个分组当前激活的项目 id（未使用项目时为 null）
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CurrentProfileIds {
-    pub claude: Option<String>,
-    pub claude_desktop: Option<String>,
-    pub codex: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProfilesResponse {
-    pub profiles: Vec<ProfileDto>,
-    pub current_ids: CurrentProfileIds,
-}
+pub use crate::services::profile_view::{CurrentProfileIds, ProfileDto, ProfilesResponse};
 
 /// Profile 应用完成后的统一收尾：发事件 + 重建托盘菜单
 ///
@@ -69,33 +21,12 @@ pub fn emit_profile_apply_events(
     scope: ProfileScope,
     desktop_was_mapping: bool,
 ) {
-    for app_type in scope.apps().iter() {
-        let app_str = app_type.as_str();
-        let (_, auto_failover_enabled) = state.db.get_proxy_flags_sync(app_str);
-        let proxy_enabled = crate::mode::current::is_proxy(app_type);
-        let provider_id = crate::mode::current::provider_for(
-            &state.db,
-            app_type,
-            crate::mode::current::Purpose::InUse,
-        )
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-        let event_data = serde_json::json!({
-            "appType": app_str,
-            "proxyEnabled": proxy_enabled,
-            "autoFailoverEnabled": auto_failover_enabled,
-            "providerId": provider_id,
-        });
-        if let Err(e) = app.emit("provider-switched", event_data) {
-            log::error!("发射 provider-switched 事件失败: {e}");
+    // 事件 payload 的构造只有一份，在 `services::profile_view`：服务端经
+    // event_sink 发、桌面经 AppHandle 发，形状因此不可能各走各的。
+    for (name, payload) in crate::services::profile_view::apply_events(state, profile_id, scope) {
+        if let Err(e) = app.emit(name, payload) {
+            log::error!("发事件 {name} 失败: {e}");
         }
-    }
-    if let Err(e) = app.emit(
-        "profile-applied",
-        serde_json::json!({ "profileId": profile_id, "scope": scope.as_str() }),
-    ) {
-        log::error!("发射 profile-applied 事件失败: {e}");
     }
     crate::tray::refresh_tray_menu(app);
     if scope.apps().contains(&AppType::ClaudeDesktop) {

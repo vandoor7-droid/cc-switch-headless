@@ -329,6 +329,14 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("list_backup_locations", list_backup_locations as Handler);
         table.insert("delete_backup_location", delete_backup_location as Handler);
 
+        // ---- Profile（配置集）----
+        table.insert("list_profiles", list_profiles as Handler);
+        table.insert("create_profile", create_profile as Handler);
+        table.insert("update_profile", update_profile as Handler);
+        table.insert("delete_profile", delete_profile as Handler);
+        table.insert("apply_profile", apply_profile as Handler);
+        table.insert("clear_current_profile", clear_current_profile as Handler);
+
         // ---- Codex 会话压缩 / 过期提示 / 日志 ----
         table.insert(
             "get_codex_session_compression",
@@ -1996,6 +2004,178 @@ fn delete_backup_location(_context: Arc<Context>, args: Value) -> HandlerFuture 
 }
 
 // ============================================================================
+// ============================================================================
+// Profile（配置集）
+//
+// 传输形状在 `services::profile_view`，桌面命令与这里共用——它不在 desktop
+// 门控里，两边的序列化形状因此不可能漂。
+//
+// `apply_profile` **必须在阻塞线程池上跑**：桌面命令体的注释写明
+// `ProviderService::switch` 内部用 `block_on` 取切换锁，放进 async 命令会在
+// 运行时线程上 panic。`blocking()` 正好把它放到阻塞池。
+//
+// 桌面侧应用完还会重建托盘、并把 Claude Desktop 的映射服务同步过去。前者服务端
+// 没有托盘；后者是写外部客户端配置，按决策 #5 一律不接。
+// ============================================================================
+
+fn list_profiles(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        blocking(move || {
+            let profiles = crate::services::profile::ProfileService::list(&state)
+                .map_err(|error| error.to_string())?;
+            let current_ids = crate::services::profile_view::CurrentProfileIds {
+                claude: state
+                    .db
+                    .get_current_profile_id(crate::services::profile::ProfileScope::Claude.as_str())
+                    .map_err(|error| error.to_string())?,
+                claude_desktop: state
+                    .db
+                    .get_current_profile_id(
+                        crate::services::profile::ProfileScope::ClaudeDesktop.as_str(),
+                    )
+                    .map_err(|error| error.to_string())?,
+                codex: state
+                    .db
+                    .get_current_profile_id(crate::services::profile::ProfileScope::Codex.as_str())
+                    .map_err(|error| error.to_string())?,
+            };
+            Ok(crate::services::profile_view::ProfilesResponse {
+                profiles: profiles.into_iter().map(Into::into).collect(),
+                current_ids,
+            })
+        })
+        .await
+        .and_then(serializable)
+    })
+}
+
+fn create_profile(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            name: String,
+            scope: String,
+        }
+        let Args { name, scope } = parse(args)?;
+        let state = context.require_state()?;
+        blocking(move || {
+            let scope = crate::services::profile::ProfileScope::parse(&scope)
+                .map_err(|error| error.to_string())?;
+            let profile = crate::services::profile::ProfileService::create(&state, &name, scope)
+                .map_err(|error| error.to_string())?;
+            serializable(crate::services::profile_view::ProfileDto::from(profile))
+        })
+        .await
+    })
+}
+
+fn update_profile(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            id: String,
+            name: Option<String>,
+            resnapshot: Option<bool>,
+            scope: Option<String>,
+        }
+        let Args {
+            id,
+            name,
+            resnapshot,
+            scope,
+        } = parse(args)?;
+        let state = context.require_state()?;
+        blocking(move || {
+            let scope = scope
+                .map(|s| crate::services::profile::ProfileScope::parse(&s))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let profile = crate::services::profile::ProfileService::update(
+                &state,
+                &id,
+                name,
+                resnapshot.unwrap_or(false),
+                scope,
+            )
+            .map_err(|error| error.to_string())?;
+            serializable(crate::services::profile_view::ProfileDto::from(profile))
+        })
+        .await
+    })
+}
+
+fn delete_profile(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            id: String,
+        }
+        let Args { id } = parse(args)?;
+        let state = context.require_state()?;
+        blocking(move || {
+            crate::services::profile::ProfileService::delete(&state, &id)
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn clear_current_profile(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            scope: String,
+        }
+        let Args { scope } = parse(args)?;
+        let state = context.require_state()?;
+        blocking(move || {
+            let scope = crate::services::profile::ProfileScope::parse(&scope)
+                .map_err(|error| error.to_string())?;
+            state
+                .db
+                .set_current_profile_id(scope.as_str(), None)
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+        Ok(Value::Bool(true))
+    })
+}
+
+/// 应用一份 profile，返回遗留的警告（桌面命令同名同义）。
+fn apply_profile(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            id: String,
+            scope: String,
+        }
+        let Args { id, scope } = parse(args)?;
+        let state = context.require_state()?;
+
+        // `ProviderService::switch` 内部 `block_on` 取切换锁，在 async 任务里跑
+        // 会在运行时线程上 panic —— 整段丢进阻塞池。
+        let outcome = blocking(move || {
+            let scope = crate::services::profile::ProfileScope::parse(&scope)
+                .map_err(|error| error.to_string())?;
+            let warnings = crate::services::profile::ProfileService::apply(&state, &id, scope)
+                .map_err(|error| error.to_string())?;
+            // 事件形状与桌面一致，只是换条通道发：服务端没有 AppHandle，走
+            // event_sink，前端拿到的 payload 一模一样。
+            for (name, payload) in crate::services::profile_view::apply_events(&state, &id, scope) {
+                crate::event_sink::emit(name, payload);
+            }
+            // 桌面侧还会重建托盘、把 Claude Desktop 的映射服务同步过去：前者
+            // 服务端没有托盘，后者是写外部客户端配置（决策 #5 不接）。
+            Ok(warnings)
+        })
+        .await?;
+        serializable(outcome)
+    })
+}
+
 // 导入导出与数据库备份
 //
 // 桌面的文件对话框在浏览器里没有对应物：shim 用 `open_file_dialog` 选择文件后
