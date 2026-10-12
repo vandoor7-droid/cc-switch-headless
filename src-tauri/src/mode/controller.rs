@@ -1493,21 +1493,49 @@ pub async fn record_failover_route(
 /// | 0 | 有 | 写回直连投影 |
 /// | 0 | 无 | 直连 |
 ///
+/// 启动时要不要把模式投影写回外部 CLI 配置（`~/.claude`、`~/.codex` …）。
+///
+/// 默认**开**：桌面版与 web 版的「本地路由」都靠这一步把客户端指向 127.0.0.1
+/// 的代理地址，关掉等于该功能失效。
+///
+/// 但有的宿主只要代理本身、由自己把出站指向代理，不需要 cc-switch 去改别人的
+/// 配置文件（DSH 插件就是这种）。这类宿主置 `CC_SWITCH_CLIENT_PROJECTION=off`
+/// 即可：只动自己的 `~/.cc-switch` 状态，外部 CLI 配置一律不碰。
+///
+/// 注意这里管的是**写**。启动时读 live 配置导入数据库是另一回事——那是保留的
+/// 迁移通道，只读不写，不受此开关影响。
+pub fn client_projection_enabled() -> bool {
+    !matches!(
+        std::env::var("CC_SWITCH_CLIENT_PROJECTION")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "off" | "0" | "false"
+    )
+}
+
 /// 有遗留物时以 `enabled` 为准（旧版是最后一个写入者）；没有时以 `live-state.json`
 /// 为准，它还没有值就按 `enabled` 定。
 pub async fn startup(state: &AppState) {
-    for app in PROXY_APPS {
-        let result = match lock_settled(state, &app).await {
-            Ok(_guard) => startup_app(state, &app).await,
-            Err(error) => Err(error.to_string()),
-        };
-        if let Err(error) = result {
-            log::error!("启动时恢复 {} 的模式失败: {error}", app.as_str());
+    if client_projection_enabled() {
+        for app in PROXY_APPS {
+            let result = match lock_settled(state, &app).await {
+                Ok(_guard) => startup_app(state, &app).await,
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = result {
+                log::error!("启动时恢复 {} 的模式失败: {error}", app.as_str());
+            }
         }
+        ensure_desktop_mapping_service(state).await;
+    } else {
+        log::info!(
+            "客户端投影已关闭（CC_SWITCH_CLIENT_PROJECTION=off）：\
+             启动时不改写任何外部 CLI 配置，只动 ~/.cc-switch 自己的状态"
+        );
     }
     // 接上失败退回直连的应用可能已经把代理拉起来了。
     stop_server_if_unused(state).await;
-    ensure_desktop_mapping_service(state).await;
     // 记一次新启动的 Codex 会读到的目录：兜住启动时补完的操作和 CC Switch 没开时的外部修改。
     codex_client_catalog::observe(&DeviceStore::for_device());
 }
