@@ -7,6 +7,7 @@ pub mod config;
 pub mod env_checker;
 pub mod env_manager;
 pub mod failover;
+pub mod global_proxy;
 pub mod import_export;
 pub mod mcp;
 pub mod model_fetch;

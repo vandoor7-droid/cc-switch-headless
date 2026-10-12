@@ -270,6 +270,26 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("reset_circuit_breaker", reset_circuit_breaker as Handler);
         table.insert("get_provider_health", get_provider_health as Handler);
 
+        // ---- 自定义端点 / 测速 ----
+        table.insert("get_custom_endpoints", get_custom_endpoints as Handler);
+        table.insert("add_custom_endpoint", add_custom_endpoint as Handler);
+        table.insert("remove_custom_endpoint", remove_custom_endpoint as Handler);
+        table.insert(
+            "update_endpoint_last_used",
+            update_endpoint_last_used as Handler,
+        );
+        table.insert("test_api_endpoints", test_api_endpoints as Handler);
+
+        // ---- 全局出站代理 ----
+        table.insert("get_global_proxy_url", get_global_proxy_url as Handler);
+        table.insert("set_global_proxy_url", set_global_proxy_url as Handler);
+        table.insert("test_proxy_url", test_proxy_url as Handler);
+        table.insert(
+            "get_upstream_proxy_status",
+            get_upstream_proxy_status as Handler,
+        );
+        table.insert("scan_local_proxies", scan_local_proxies as Handler);
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -1267,6 +1287,179 @@ fn get_provider_health(context: Arc<Context>, args: Value) -> HandlerFuture {
             .map_err(|error| error.to_string())?;
         serializable(health)
     })
+}
+
+// ============================================================================
+// 自定义端点 / 测速
+//
+// 与熔断那组同理：桌面命令体只是「解析 → 调 `ProviderService` /
+// `SpeedtestService`」，两个 service 都在非门控模块里，这里照搬即可。
+// 命令层的参数是 `#[allow(non_snake_case)] providerId`（Tauri 直接收驼峰），
+// 所以下面用 `rename_all = "camelCase"` 收同一份线上形状。
+// ============================================================================
+
+fn get_custom_endpoints(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            app: String,
+            provider_id: String,
+        }
+        let Args { app, provider_id } = parse(args)?;
+        let state = context.require_state()?;
+        blocking(move || {
+            let app_type = to_app_type(&app)?;
+            ProviderService::get_custom_endpoints(&state, app_type, &provider_id)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .and_then(serializable)
+    })
+}
+
+fn add_custom_endpoint(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            app: String,
+            provider_id: String,
+            url: String,
+        }
+        let Args {
+            app,
+            provider_id,
+            url,
+        } = parse(args)?;
+        let state = context.require_state()?;
+        blocking(move || {
+            let app_type = to_app_type(&app)?;
+            ProviderService::add_custom_endpoint(&state, app_type, &provider_id, url)
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn remove_custom_endpoint(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            app: String,
+            provider_id: String,
+            url: String,
+        }
+        let Args {
+            app,
+            provider_id,
+            url,
+        } = parse(args)?;
+        let state = context.require_state()?;
+        blocking(move || {
+            let app_type = to_app_type(&app)?;
+            ProviderService::remove_custom_endpoint(&state, app_type, &provider_id, url)
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn update_endpoint_last_used(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            app: String,
+            provider_id: String,
+            url: String,
+        }
+        let Args {
+            app,
+            provider_id,
+            url,
+        } = parse(args)?;
+        let state = context.require_state()?;
+        blocking(move || {
+            let app_type = to_app_type(&app)?;
+            ProviderService::update_endpoint_last_used(&state, app_type, &provider_id, url)
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+        Ok(Value::Bool(true))
+    })
+}
+
+/// 测速不需要 state，也就不该去 `require_state()`：桌面版同样收不到 AppState。
+fn test_api_endpoints(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            urls: Vec<String>,
+            timeout_secs: Option<u64>,
+        }
+        let Args { urls, timeout_secs } = parse(args)?;
+        let results =
+            crate::services::speedtest::SpeedtestService::test_endpoints(urls, timeout_secs)
+                .await
+                .map_err(|error| error.to_string())?;
+        serializable(results)
+    })
+}
+
+// ============================================================================
+// 全局出站代理
+//
+// 逻辑在 `services::global_proxy`（原本整段住在 desktop 门控的命令层里），
+// 这里只做解析与调用。`test_proxy_url` 与 `upstream_proxy_status` 在桌面版
+// 也不接 state，照此处理。
+// ============================================================================
+
+fn get_global_proxy_url(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let url = crate::services::global_proxy::get_global_proxy_url(&state)?;
+        serializable(url)
+    })
+}
+
+fn set_global_proxy_url(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            url: String,
+        }
+        let Args { url } = parse(args)?;
+        let state = context.require_state()?;
+        crate::services::global_proxy::set_global_proxy_url(&state, url)?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn test_proxy_url(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            url: String,
+        }
+        let Args { url } = parse(args)?;
+        let result = crate::services::global_proxy::test_proxy_url(url).await?;
+        serializable(result)
+    })
+}
+
+fn get_upstream_proxy_status(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move { serializable(crate::services::global_proxy::upstream_proxy_status()) })
+}
+
+fn scan_local_proxies(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    // 纯 TCP 探测，丢进阻塞线程池，别占着 async runtime：`deferred` 就是
+    // 「阻塞线程池 + 序列化」这条组合，不必手写 `blocking(...).await`
+    deferred(|| Ok(crate::services::global_proxy::scan_local_proxies_blocking()))
 }
 
 // ============================================================================
