@@ -290,6 +290,29 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         );
         table.insert("scan_local_proxies", scan_local_proxies as Handler);
 
+        // ---- Stack（聚合）模式 ----
+        table.insert(
+            "exit_proxy_apps_in_mode",
+            exit_proxy_apps_in_mode as Handler,
+        );
+        table.insert("get_proxy_stack", get_proxy_stack as Handler);
+        table.insert("set_proxy_stack_member", set_proxy_stack_member as Handler);
+        table.insert(
+            "adopt_codex_stack_catalog",
+            adopt_codex_stack_catalog as Handler,
+        );
+        table.insert(
+            "restart_codex_app_server_daemon",
+            restart_codex_app_server_daemon as Handler,
+        );
+
+        // ---- 连通性检查 / 拉模型 ----
+        table.insert("stream_check_provider", stream_check_provider as Handler);
+        table.insert(
+            "fetch_models_for_config",
+            fetch_models_for_config as Handler,
+        );
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -1460,6 +1483,181 @@ fn scan_local_proxies(_context: Arc<Context>, _args: Value) -> HandlerFuture {
     // 纯 TCP 探测，丢进阻塞线程池，别占着 async runtime：`deferred` 就是
     // 「阻塞线程池 + 序列化」这条组合，不必手写 `blocking(...).await`
     deferred(|| Ok(crate::services::global_proxy::scan_local_proxies_blocking()))
+}
+
+// ============================================================================
+// Stack（聚合）模式
+//
+// 与前面几组同理：命令体是「解析 → 调 `mode::controller`」，那个模块不在 desktop
+// 门控里。唯一差别是桌面版还会刷托盘，而 web 模式没有托盘——`update_tray_menu`
+// 在这里就是回 `true` 充当「刷新成功」，下面照同一约定略过刷新。
+// ============================================================================
+
+fn exit_proxy_apps_in_mode(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            stack: bool,
+        }
+        let Args { stack } = parse(args)?;
+        let state = context.require_state()?;
+        let exited = crate::mode::controller::exit_apps_in_mode(&state, stack).await?;
+        serializable(exited)
+    })
+}
+
+fn get_proxy_stack(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            app_type: String,
+        }
+        let Args { app_type } = parse(args)?;
+        let app = require_proxy_app(&app_type)?;
+        let state = context.require_state()?;
+        let view = crate::mode::controller::stack_view_with_clients(&state, &app).await?;
+        serializable(view)
+    })
+}
+
+fn set_proxy_stack_member(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            app_type: String,
+            provider_id: String,
+            enabled: bool,
+        }
+        let Args {
+            app_type,
+            provider_id,
+            enabled,
+        } = parse(args)?;
+        let app = require_proxy_app(&app_type)?;
+        let state = context.require_state()?;
+        // 桌面版这里还 `refresh_tray_menu(&app_handle)`：托盘的聚合子菜单只列名单
+        // 成员，改完必须重建。web 模式没有托盘，也就没有那张子菜单要重建。
+        let hint = crate::mode::controller::set_stack_member(&state, &app, &provider_id, enabled)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        serializable(hint)
+    })
+}
+
+fn adopt_codex_stack_catalog(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let hint = crate::mode::controller::adopt_codex_stack_catalog(&state).await?;
+        serializable(hint)
+    })
+}
+
+/// 重启 Codex 的托管守护进程。
+///
+/// 桌面版命令体就这么点：不接 state，只把 `restart_daemon` 送进 runtime 隔离层
+/// （它会写文件，不该在异步任务里做）。
+fn restart_codex_app_server_daemon(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let outcome = crate::services::provider::codex_direct::off_runtime(
+            crate::services::provider::codex_client_catalog::restart_daemon,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        serializable(outcome)
+    })
+}
+
+// ============================================================================
+// 供应商连通性检查 / 拉取模型列表
+// ============================================================================
+
+/// 只探测 base_url 可达性，不发真实模型请求，也不碰熔断器。
+///
+/// 桌面版还接一个 `CopilotAuthState`，把 Copilot 供应商的 base_url 解析成当前
+/// OAuth 端点。服务端没接入托管账号登录（`GET /api/capabilities` 的 `pageAuth`
+/// 就是 false），因此这里恒传 `None`：非 Copilot 供应商本来就走 `None`，Copilot
+/// 那一家退化为按 `settings_config` 里的地址探测——与「托管账号未接入」是一致的
+/// 降级，而不是假装解析成功。
+fn stream_check_provider(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            app_type: String,
+            provider_id: String,
+        }
+        let Args {
+            app_type,
+            provider_id,
+        } = parse(args)?;
+        let app_type = to_app_type(&app_type)?;
+        let state = context.require_state()?;
+
+        let providers = state
+            .db
+            .get_all_providers(app_type.as_str())
+            .map_err(|error| error.to_string())?;
+        let provider = providers
+            .get(&provider_id)
+            .ok_or_else(|| format!("供应商 {provider_id} 不存在"))?;
+
+        let result = crate::services::stream_check::StreamCheckService::check_with_retry(
+            &app_type,
+            provider,
+            &crate::services::stream_check::StreamCheckConfig::default(),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        serializable(result)
+    })
+}
+
+/// 用 OpenAI 兼容的 `GET /v1/models` 拉模型列表，不需要 state。
+fn fetch_models_for_config(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            base_url: String,
+            api_key: String,
+            is_full_url: Option<bool>,
+            models_url: Option<String>,
+            custom_user_agent: Option<String>,
+            api_format: Option<String>,
+            request_headers: Option<std::collections::BTreeMap<String, String>>,
+        }
+        let Args {
+            base_url,
+            api_key,
+            is_full_url,
+            models_url,
+            custom_user_agent,
+            api_format,
+            request_headers,
+        } = parse(args)?;
+
+        // 与桌面版共用同一条 UA 归一：非法 UA 静默忽略，不阻断取模型
+        let user_agent = crate::provider::parse_custom_user_agent(custom_user_agent.as_deref())
+            .ok()
+            .flatten();
+
+        let models = crate::services::model_fetch::fetch_models(
+            &base_url,
+            &api_key,
+            is_full_url.unwrap_or(false),
+            models_url.as_deref(),
+            user_agent,
+            api_format.as_deref(),
+            request_headers.as_ref(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        serializable(models)
+    })
 }
 
 // ============================================================================
