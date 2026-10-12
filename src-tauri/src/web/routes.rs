@@ -396,6 +396,10 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("get_balance", get_balance as Handler);
         table.insert("get_coding_plan_quota", get_coding_plan_quota as Handler);
 
+        // ---- xAI 托管账号：额度 / 模型 ----
+        table.insert("get_xai_oauth_quota", get_xai_oauth_quota as Handler);
+        table.insert("get_xai_oauth_models", get_xai_oauth_models as Handler);
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -2569,6 +2573,48 @@ fn get_coding_plan_quota(_context: Arc<Context>, args: Value) -> HandlerFuture {
         )
         .await?;
         serializable(quota)
+    })
+}
+
+// ============================================================================
+// xAI 托管账号：订阅额度与模型
+//
+// 查询实现在 `services::xai_oauth_queries`（桌面命令与这里共用）。管理器从
+// `proxy::oauth_registry` 取而不是 Tauri 的 `.manage()` 容器——后者只在桌面
+// 构建里存在，而 `web/state.rs` 启动时同样会把 `XaiOAuthManager` 注册进
+// registry，两种构建拿到同一个实例。
+//
+// 这两条正是 `GET /api/capabilities` 里 `pageAuth` 标 false 的那一类：托管账号
+// 的**登录流程**还没接，但转发链路与查询本来就在。接上查询不影响登录缺失。
+// ============================================================================
+
+fn get_xai_oauth_quota(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            account_id: Option<String>,
+        }
+        let Args { account_id } = parse(args)?;
+        let manager = crate::proxy::oauth_registry::xai()
+            .ok_or_else(|| "No xAI OAuth manager registered".to_string())?;
+        let quota = crate::services::xai_oauth_queries::query_quota(&manager, account_id).await?;
+        serializable(quota)
+    })
+}
+
+fn get_xai_oauth_models(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            account_id: Option<String>,
+        }
+        let Args { account_id } = parse(args)?;
+        let manager = crate::proxy::oauth_registry::xai()
+            .ok_or_else(|| "No xAI OAuth manager registered".to_string())?;
+        let models = crate::services::xai_oauth_queries::list_models(&manager, account_id).await?;
+        serializable(models)
     })
 }
 

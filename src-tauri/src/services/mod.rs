@@ -44,6 +44,7 @@ pub mod webdav;
 pub mod webdav_auto_sync;
 pub mod webdav_flow;
 pub mod webdav_sync;
+pub mod xai_oauth_queries;
 
 pub use config::ConfigService;
 pub use mcp::McpService;
