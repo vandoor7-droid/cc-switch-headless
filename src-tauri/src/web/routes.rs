@@ -337,6 +337,19 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("apply_profile", apply_profile as Handler);
         table.insert("clear_current_profile", clear_current_profile as Handler);
 
+        // ---- WebDAV 同步 ----
+        table.insert("webdav_test_connection", webdav_test_connection as Handler);
+        table.insert("webdav_sync_upload", webdav_sync_upload as Handler);
+        table.insert("webdav_sync_download", webdav_sync_download as Handler);
+        table.insert(
+            "webdav_sync_save_settings",
+            webdav_sync_save_settings as Handler,
+        );
+        table.insert(
+            "webdav_sync_fetch_remote_info",
+            webdav_sync_fetch_remote_info as Handler,
+        );
+
         // ---- Codex 会话压缩 / 过期提示 / 日志 ----
         table.insert(
             "get_codex_session_compression",
@@ -2173,6 +2186,142 @@ fn apply_profile(context: Arc<Context>, args: Value) -> HandlerFuture {
         })
         .await?;
         serializable(outcome)
+    })
+}
+
+// ============================================================================
+// WebDAV 同步
+//
+// 流程胶水在 `services::webdav_flow`（原先住在 desktop 门控的命令层里，两边
+// 现在共用同一份）；真正做网络 IO 的部分本来就在 `services::webdav_sync`。
+// 全局同步互斥锁也在那边——两个恢复同时跑会把文件写成半新半旧，所以它只该
+// 有一处定义，这里只是去取。
+// ============================================================================
+
+fn webdav_test_connection(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            settings: crate::settings::WebDavSyncSettings,
+            preserve_empty_password: Option<bool>,
+        }
+        let Args {
+            settings,
+            preserve_empty_password,
+        } = parse(args)?;
+
+        // 空密码有两种意思：没改过 / 清空。这里按桌面命令的默认走「没改过」。
+        let preserve_empty = preserve_empty_password.unwrap_or(true);
+        let resolved = crate::services::webdav_flow::resolve_password_for_request(
+            settings,
+            crate::settings::get_webdav_sync_settings(),
+            preserve_empty,
+        );
+        crate::services::webdav_sync::check_connection(&resolved)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({ "success": true, "message": "WebDAV connection ok" }))
+    })
+}
+
+fn webdav_sync_upload(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let db = state.db.clone();
+        let mut settings = crate::services::webdav_flow::require_enabled_settings()?;
+
+        let result = crate::services::webdav_flow::run_with_lock(
+            crate::services::webdav_sync::upload(&db, &mut settings),
+        )
+        .await;
+        let value = crate::services::webdav_flow::map_sync_result(result, |error| {
+            crate::services::webdav_flow::persist_sync_error(&mut settings, error, "manual")
+        })?;
+        serializable(value)
+    })
+}
+
+fn webdav_sync_download(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let db = state.db.clone();
+        let app_state_for_sync = state.clone();
+        let mut settings = crate::services::webdav_flow::require_enabled_settings()?;
+
+        // 下载与「把快照投影成各处 live 文件」必须同持一把锁：否则另一轮恢复
+        // 可能插进「库已应用、投影没跑完」的窗口。桌面命令就是这么做的。
+        let sync_result = crate::services::webdav_flow::run_download_with_lock(
+            crate::services::webdav_sync::download(&db, &mut settings),
+            |result| async move {
+                let post_sync_result = crate::host::spawn_blocking(move || {
+                    crate::services::sync_support::run_post_import_sync(&app_state_for_sync)
+                })
+                .await
+                .map_err(|e| e.to_string());
+                Ok((result, post_sync_result))
+            },
+        )
+        .await;
+        let (mut result, post_sync_result) =
+            crate::services::webdav_flow::map_sync_result(sync_result, |error| {
+                crate::services::webdav_flow::persist_sync_error(&mut settings, error, "manual")
+            })?;
+
+        // 投影是尽力而为：快照恢复已经成功了，失败只作为警告附在结果上。
+        let warning =
+            crate::services::sync_support::post_sync_warning_from_result(post_sync_result);
+        if let Some(message) = warning.as_ref() {
+            log::warn!("[WebDAV] post-download sync warning: {message}");
+        }
+        result = crate::services::sync_support::attach_warning(result, warning);
+        serializable(result)
+    })
+}
+
+fn webdav_sync_save_settings(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            settings: crate::settings::WebDavSyncSettings,
+            password_touched: Option<bool>,
+        }
+        let Args {
+            settings,
+            password_touched,
+        } = parse(args)?;
+
+        let password_touched = password_touched.unwrap_or(false);
+        let existing = crate::settings::get_webdav_sync_settings();
+        let mut sync_settings = crate::services::webdav_flow::resolve_password_for_request(
+            settings,
+            existing.clone(),
+            !password_touched,
+        );
+
+        // 保留前端不管理的字段（同步状态由服务端写）
+        if let Some(existing_settings) = existing {
+            sync_settings.status = existing_settings.status;
+        }
+
+        sync_settings.normalize();
+        sync_settings
+            .validate()
+            .map_err(|error| error.to_string())?;
+        crate::settings::set_webdav_sync_settings(Some(sync_settings))
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({ "success": true }))
+    })
+}
+
+fn webdav_sync_fetch_remote_info(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let settings = crate::services::webdav_flow::require_enabled_settings()?;
+        let info = crate::services::webdav_sync::fetch_remote_info(&settings)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(info.unwrap_or_else(|| serde_json::json!({ "empty": true })))
     })
 }
 
