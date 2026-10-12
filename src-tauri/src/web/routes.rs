@@ -391,6 +391,11 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
             s3_sync_fetch_remote_info as Handler,
         );
 
+        // ---- 用量额度：余额 / 编码套餐 / 订阅 ----
+        table.insert("get_subscription_quota", get_subscription_quota as Handler);
+        table.insert("get_balance", get_balance as Handler);
+        table.insert("get_coding_plan_quota", get_coding_plan_quota as Handler);
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -2467,6 +2472,103 @@ fn s3_sync_fetch_remote_info(_context: Arc<Context>, _args: Value) -> HandlerFut
             .await
             .map_err(|error| error.to_string())?;
         Ok(info.unwrap_or_else(|| serde_json::json!({ "empty": true })))
+    })
+}
+
+// ============================================================================
+// 用量额度：余额 / 编码套餐 / 订阅
+//
+// 这三条都是「解析参数 → 调 service」，service 全在非门控模块里，原样搬。
+//
+// `get_subscription_quota` 桌面版还做两件收尾：把快照写进 usage_cache、并经
+// AppHandle 发 `usage-cache-updated`。缓存在 `AppState` 里（两边同源），事件
+// 换 `event_sink` 发——payload 一字不改，前端 `useUsageCacheBridge` 依赖它。
+//
+// 注释里那条语义值得留住：**瞬时传输失败不写缓存、不发事件**，保留上一份托盘
+// 快照，与前端 react-query「reject 保留上次 data」一致；认证/HTTP 失败才替换
+// 快照，好让界面把失效的额度收起来。
+// ============================================================================
+
+fn get_subscription_quota(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            tool: String,
+        }
+        let Args { tool } = parse(args)?;
+        let state = context.require_state()?;
+
+        let inner = crate::services::subscription::get_subscription_quota(&tool).await;
+        if let Ok(snapshot) = &inner {
+            if let Ok(app_type) = crate::app_config::AppType::from_str(&tool) {
+                // `AppType` 不是 `Copy`：先把 `as_str` 取下来，再把值移进缓存
+                let app_str = app_type.as_str().to_string();
+                state
+                    .usage_cache
+                    .put_subscription(app_type, snapshot.clone());
+                crate::event_sink::emit(
+                    "usage-cache-updated",
+                    serde_json::json!({
+                        "kind": "subscription",
+                        "appType": app_str,
+                        "data": snapshot,
+                    }),
+                );
+            }
+        }
+        inner.and_then(serializable)
+    })
+}
+
+/// 供应商余额查询（按 base_url + api_key，无 state）。
+fn get_balance(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            base_url: String,
+            api_key: String,
+        }
+        let Args { base_url, api_key } = parse(args)?;
+        let result = crate::services::balance::get_balance(&base_url, &api_key).await?;
+        serializable(result)
+    })
+}
+
+/// 编码套餐额度查询。火山方舟用 AK/SK 签名查询，其他供应商走 api_key。
+fn get_coding_plan_quota(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            base_url: String,
+            api_key: String,
+            access_key_id: Option<String>,
+            secret_access_key: Option<String>,
+            coding_plan_provider: Option<String>,
+            team_organization_id: Option<String>,
+            team_project_id: Option<String>,
+        }
+        let Args {
+            base_url,
+            api_key,
+            access_key_id,
+            secret_access_key,
+            coding_plan_provider,
+            team_organization_id,
+            team_project_id,
+        } = parse(args)?;
+        let quota = crate::services::coding_plan::get_coding_plan_quota(
+            &base_url,
+            &api_key,
+            access_key_id.as_deref(),
+            secret_access_key.as_deref(),
+            coding_plan_provider.as_deref(),
+            team_organization_id.as_deref(),
+            team_project_id.as_deref(),
+        )
+        .await?;
+        serializable(quota)
     })
 }
 
