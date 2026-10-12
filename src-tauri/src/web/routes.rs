@@ -313,6 +313,18 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
             fetch_models_for_config as Handler,
         );
 
+        // ---- 设置（日志 / 整流 / 优化）----
+        table.insert("get_log_config", get_log_config as Handler);
+        table.insert("set_log_config", set_log_config as Handler);
+        table.insert("get_rectifier_config", get_rectifier_config as Handler);
+        table.insert("set_rectifier_config", set_rectifier_config as Handler);
+        table.insert("get_optimizer_config", get_optimizer_config as Handler);
+        table.insert("set_optimizer_config", set_optimizer_config as Handler);
+
+        // ---- 环境变量 ----
+        table.insert("delete_env_vars", delete_env_vars as Handler);
+        table.insert("restore_env_backup", restore_env_backup as Handler);
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -1657,6 +1669,127 @@ fn fetch_models_for_config(_context: Arc<Context>, args: Value) -> HandlerFuture
         .await
         .map_err(|error| error.to_string())?;
         serializable(models)
+    })
+}
+
+// ============================================================================
+// 设置（日志 / 整流 / 优化）与环境变量
+//
+// 前六条的命令体就是「解析 → 调 `db`」，这里照搬。`set_log_config` 多一步
+// `log::set_max_level`：桌面与服务端都要把新级别当场生效，否则写了库而运行时
+// 还按旧级别过滤。两步、无分支，没有可抽出的「真实逻辑」，故镜像而非搬运——
+// 若将来这一步长出分支，就该按本文件的约定移进 `services/`。
+//
+// 后两条走 `services::env_manager`（桌面命令本身就是一跳委托）。
+// ============================================================================
+
+fn get_log_config(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let config = state
+            .db
+            .get_log_config()
+            .map_err(|error| error.to_string())?;
+        serializable(config)
+    })
+}
+
+fn set_log_config(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            config: crate::proxy::types::LogConfig,
+        }
+        let Args { config } = parse(args)?;
+        let state = context.require_state()?;
+        state
+            .db
+            .set_log_config(&config)
+            .map_err(|error| error.to_string())?;
+        // 与桌面命令同一步：写完库立刻让运行时按新级别过滤
+        log::set_max_level(config.to_level_filter());
+        Ok(Value::Bool(true))
+    })
+}
+
+fn get_rectifier_config(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let config = state
+            .db
+            .get_rectifier_config()
+            .map_err(|error| error.to_string())?;
+        serializable(config)
+    })
+}
+
+fn set_rectifier_config(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            config: crate::proxy::types::RectifierConfig,
+        }
+        let Args { config } = parse(args)?;
+        let state = context.require_state()?;
+        state
+            .db
+            .set_rectifier_config(&config)
+            .map_err(|error| error.to_string())?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn get_optimizer_config(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let config = state
+            .db
+            .get_optimizer_config()
+            .map_err(|error| error.to_string())?;
+        serializable(config)
+    })
+}
+
+fn set_optimizer_config(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            config: crate::proxy::types::OptimizerConfig,
+        }
+        let Args { config } = parse(args)?;
+        let state = context.require_state()?;
+        state
+            .db
+            .set_optimizer_config(&config)
+            .map_err(|error| error.to_string())?;
+        Ok(Value::Bool(true))
+    })
+}
+
+/// 删掉冲突的环境变量，删前自动备份；返回备份信息。
+fn delete_env_vars(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            conflicts: Vec<crate::services::env_checker::EnvConflict>,
+        }
+        let Args { conflicts } = parse(args)?;
+        let backup = crate::services::env_manager::delete_env_vars(conflicts)?;
+        serializable(backup)
+    })
+}
+
+/// 从备份文件恢复环境变量。
+fn restore_env_backup(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            backup_path: String,
+        }
+        let Args { backup_path } = parse(args)?;
+        crate::services::env_manager::restore_from_backup(backup_path)?;
+        Ok(Value::Bool(true))
     })
 }
 
