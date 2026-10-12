@@ -225,6 +225,101 @@ fn filter_supported(
         .collect()
 }
 
+/// 重置某个供应商的熔断器；若它恢复后在队列里优先级更高，把路由切回它。
+///
+/// 桌面命令层（`commands/proxy.rs`）与服务端（`web/routes.rs`）共用这一份实现。
+/// 命令体里不是纯粹的"改一行状态"：它带一个真实分支——恢复的供应商要不要
+/// 回切——要对照 `sort_index`、自动故障转移开关与代理是否在跑。这种逻辑
+/// 拷两份一定会漂移，所以按本文件的约定搬到这里。
+///
+/// 顺序与上游一致：先写数据库健康状态 → 再清代理内存里的熔断器 → 最后才
+/// 可能回切。前三步即使不做回切也必须发生。
+pub async fn reset_circuit_breaker(
+    state: &AppState,
+    provider_id: &str,
+    app_type: &str,
+) -> Result<(), String> {
+    // 入参就地升成 String，好让下面每一处 `&x` 与上游命令体里的类型一模一样，
+    // 内层 API 要 `&String` 还是 `&str` 都不必再逐个推断。
+    let provider_id = provider_id.to_string();
+    let app_type = app_type.to_string();
+
+    require_failover_app(&app_type)?;
+    let app = AppType::from_str(&app_type).map_err(|error| error.to_string())?;
+    let db = &state.db;
+
+    // 1. 重置数据库健康状态
+    db.update_provider_health(&provider_id, &app_type, true, None)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    // 2. 代理正在跑的话，同时清掉它内存里的熔断器状态
+    state
+        .proxy_service
+        .reset_provider_circuit_breaker(&provider_id, &app_type)
+        .await?;
+
+    // 3. 只有「处于代理模式 + 开了自动故障转移 + 代理确实在跑」三条同时成立
+    //    才谈得上回切；任一不成立时，前两步的重置依然有效，直接结束。
+    let app_in_proxy = crate::mode::current::is_proxy(&app);
+    let auto_failover_enabled = match db.get_proxy_config_for_app(&app_type).await {
+        Ok(config) => config.auto_failover_enabled,
+        Err(error) => {
+            log::error!(
+                "[{app_type}] Failed to read proxy_config: {error}, defaulting to disabled"
+            );
+            false
+        }
+    };
+
+    if !app_in_proxy || !auto_failover_enabled || !state.proxy_service.is_running().await {
+        return Ok(());
+    }
+
+    let Some(current_id) =
+        crate::mode::current::provider_for(db, &app, crate::mode::current::Purpose::InUse)
+            .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+
+    let queue = db
+        .get_failover_queue(&app_type)
+        .map_err(|error| error.to_string())?;
+    // 两边都用 sort_index 定位：它是队列序，也是优先级（P1 比 P2 先试）
+    let order_of = |id: &str| {
+        queue
+            .iter()
+            .find(|item| item.provider_id == id)
+            .and_then(|item| item.sort_index)
+    };
+    let (Some(restored), Some(current)) = (order_of(&provider_id), order_of(&current_id)) else {
+        return Ok(());
+    };
+    if restored >= current {
+        return Ok(());
+    }
+
+    let provider_name = db
+        .get_all_providers(&app_type)
+        .ok()
+        .and_then(|providers| providers.get(&provider_id).map(|p| p.name.clone()))
+        .unwrap_or_else(|| provider_id.clone());
+
+    log::info!(
+        "[Recovery] 供应商 {provider_id} 已恢复且优先级更高 (P{restored} vs P{current})，自动切换"
+    );
+    let switch_manager = crate::proxy::failover_switch::FailoverSwitchManager::new();
+    if let Err(error) = switch_manager
+        .try_switch(&app_type, &provider_id, &provider_name)
+        .await
+    {
+        log::error!("[Recovery] 自动切换失败: {error}");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{require_failover_app, require_failover_provider};

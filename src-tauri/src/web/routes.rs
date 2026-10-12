@@ -254,6 +254,22 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
             set_auto_failover_enabled as Handler,
         );
 
+        // ---- 熔断 / 健康 ----
+        table.insert(
+            "get_circuit_breaker_config",
+            get_circuit_breaker_config as Handler,
+        );
+        table.insert(
+            "update_circuit_breaker_config",
+            update_circuit_breaker_config as Handler,
+        );
+        table.insert(
+            "get_circuit_breaker_stats",
+            get_circuit_breaker_stats as Handler,
+        );
+        table.insert("reset_circuit_breaker", reset_circuit_breaker as Handler);
+        table.insert("get_provider_health", get_provider_health as Handler);
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -1142,6 +1158,114 @@ fn set_auto_failover_enabled(context: Arc<Context>, args: Value) -> HandlerFutur
             );
         }
         Ok(Value::Bool(true))
+    })
+}
+
+// ============================================================================
+// 熔断 / 健康
+//
+// 桌面版这五条住在 commands/proxy.rs，而那个模块只在 desktop feature 下编译。
+// 其中四条的命令体只有「解析参数 → 调 db / proxy_service」这一层，所以照搬；
+// 唯 `reset_circuit_breaker` 带真实分支（恢复后要不要按队列优先级回切），
+// 逻辑已搬进 `services::failover`，两种构建共用同一份。
+// ============================================================================
+
+fn get_circuit_breaker_config(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let config = state
+            .db
+            .get_circuit_breaker_config()
+            .await
+            .map_err(|error| error.to_string())?;
+        serializable(config)
+    })
+}
+
+fn update_circuit_breaker_config(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            config: crate::proxy::CircuitBreakerConfig,
+        }
+        let Args { config } = parse(args)?;
+        let state = context.require_state()?;
+
+        // 顺序与桌面一致：先落库，再热更运行中的代理。库写失败时不该动运行态。
+        state
+            .db
+            .update_circuit_breaker_config(&config)
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .proxy_service
+            .update_circuit_breaker_configs(config)
+            .await?;
+        Ok(Value::Bool(true))
+    })
+}
+
+/// 上游本身就是个桩，这里照它的语义返回 `null`。
+///
+/// `commands/proxy.rs` 里写着「这个功能需要访问运行中的代理服务器的内存状态，
+/// 目前先返回 None」。返回 `null` 而不是 `E_NOT_IMPLEMENTED`，是因为界面读的是
+/// 「有没有统计」——`null` 会让它安静地不显示那一栏，与桌面版一致；
+/// 报错反而会把它变成一个显眼的失败。
+fn get_circuit_breaker_stats(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            #[allow(dead_code)]
+            provider_id: String,
+            app_type: String,
+        }
+        let Args { app_type, .. } = parse(args)?;
+        // 仍然校验应用类型：无效的 app 该和桌面版一样被拒绝，桩不等于不校验
+        require_proxy_app(&app_type)?;
+        let _ = context;
+        Ok(Value::Null)
+    })
+}
+
+fn reset_circuit_breaker(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            provider_id: String,
+            app_type: String,
+        }
+        let Args {
+            provider_id,
+            app_type,
+        } = parse(args)?;
+        let state = context.require_state()?;
+        crate::services::failover::reset_circuit_breaker(&state, &provider_id, &app_type).await?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn get_provider_health(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            provider_id: String,
+            app_type: String,
+        }
+        let Args {
+            provider_id,
+            app_type,
+        } = parse(args)?;
+        require_proxy_app(&app_type)?;
+        let state = context.require_state()?;
+        let health = state
+            .db
+            .get_provider_health(&provider_id, &app_type)
+            .await
+            .map_err(|error| error.to_string())?;
+        serializable(health)
     })
 }
 
