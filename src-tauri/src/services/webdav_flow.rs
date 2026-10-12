@@ -12,6 +12,9 @@ use crate::error::AppError;
 use crate::services::webdav_sync as webdav_sync_service;
 use crate::settings::{self, WebDavSyncSettings};
 
+/// 与后端无关的收尾胶水，WebDAV 与 S3 共用——见 `services::sync_support`。
+pub use crate::services::sync_support::map_sync_result;
+
 /// 把一次失败记回设置，供界面上的「上次错误」显示。
 pub fn persist_sync_error(settings: &mut WebDavSyncSettings, error: &AppError, source: &str) {
     settings.status.last_error = Some(error.to_string());
@@ -95,18 +98,4 @@ where
         project(result).await
     })
     .await
-}
-
-/// 成功原样返回；失败先让调用方记一笔，再变成字符串错误。
-pub fn map_sync_result<T, F>(result: Result<T, AppError>, on_error: F) -> Result<T, String>
-where
-    F: FnOnce(&AppError),
-{
-    match result {
-        Ok(value) => Ok(value),
-        Err(err) => {
-            on_error(&err);
-            Err(err.to_string())
-        }
-    }
 }

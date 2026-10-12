@@ -121,3 +121,23 @@ mod tests {
         );
     }
 }
+
+/// 成功原样返回；失败先让调用方记一笔，再变成字符串错误。
+///
+/// WebDAV 与 S3 两边共用：它与具体同步后端无关，只是一种「失败要先被观察
+/// 再被传递」的收尾。放在这里而不是各自的 flow 模块，免得第三份拷贝出现。
+pub fn map_sync_result<T, F>(
+    result: Result<T, crate::error::AppError>,
+    on_error: F,
+) -> Result<T, String>
+where
+    F: FnOnce(&crate::error::AppError),
+{
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            on_error(&err);
+            Err(err.to_string())
+        }
+    }
+}

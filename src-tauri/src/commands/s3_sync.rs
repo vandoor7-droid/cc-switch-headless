@@ -3,7 +3,6 @@
 use serde_json::{json, Value};
 use tauri::State;
 
-use crate::error::AppError;
 use crate::services::s3_sync as s3_sync_service;
 use crate::services::sync_support::{
     attach_warning, post_sync_warning_from_result, run_post_import_sync,
@@ -11,89 +10,17 @@ use crate::services::sync_support::{
 use crate::settings::{self, S3SyncSettings};
 use crate::store::AppState;
 
-fn persist_sync_error(settings: &mut S3SyncSettings, error: &AppError, source: &str) {
-    settings.status.last_error = Some(error.to_string());
-    settings.status.last_error_source = Some(source.to_string());
-    let _ = settings::update_s3_sync_status(settings.status.clone());
-}
-
-fn s3_not_configured_error() -> String {
-    AppError::localized(
-        "s3.sync.not_configured",
-        "未配置 S3 同步",
-        "S3 sync is not configured.",
-    )
-    .to_string()
-}
-
-fn s3_sync_disabled_error() -> String {
-    AppError::localized("s3.sync.disabled", "S3 同步未启用", "S3 sync is disabled.").to_string()
-}
-
-fn require_enabled_s3_settings() -> Result<S3SyncSettings, String> {
-    let settings = settings::get_s3_sync_settings().ok_or_else(s3_not_configured_error)?;
-    if !settings.enabled {
-        return Err(s3_sync_disabled_error());
-    }
-    Ok(settings)
-}
-
-fn resolve_secret_for_request(
-    mut incoming: S3SyncSettings,
-    existing: Option<S3SyncSettings>,
-    preserve_empty_secret: bool,
-) -> S3SyncSettings {
-    if let Some(existing_settings) = existing {
-        if preserve_empty_secret && incoming.secret_access_key.is_empty() {
-            incoming.secret_access_key = existing_settings.secret_access_key;
-        }
-    }
-    incoming
-}
+// 流程胶水在 `services::s3_flow`：服务端的 `web/routes.rs` 与这里的命令层
+// 共用同一份实现。密钥合并、全局同步锁、错误持久化都只该有一处定义。
+use crate::services::s3_flow::{
+    map_sync_result, persist_sync_error, require_enabled_settings as require_enabled_s3_settings,
+    resolve_secret_for_request, run_download_with_lock as run_download_with_s3_lock,
+    run_with_lock as run_with_s3_lock,
+};
 
 #[cfg(test)]
 fn s3_sync_mutex() -> &'static tokio::sync::Mutex<()> {
     s3_sync_service::sync_mutex()
-}
-
-async fn run_with_s3_lock<T, Fut>(operation: Fut) -> Result<T, AppError>
-where
-    Fut: std::future::Future<Output = Result<T, AppError>>,
-{
-    s3_sync_service::run_with_sync_lock(operation).await
-}
-
-async fn run_download_with_s3_lock<T, U, DownloadFut, Project, ProjectFut>(
-    download: DownloadFut,
-    project: Project,
-) -> Result<U, AppError>
-where
-    DownloadFut: std::future::Future<Output = Result<T, AppError>>,
-    Project: FnOnce(T) -> ProjectFut,
-    ProjectFut: std::future::Future<Output = Result<U, AppError>>,
-{
-    run_with_s3_lock(async {
-        let result = {
-            let _auto_sync_suppression =
-                crate::services::s3_auto_sync::AutoSyncSuppressionGuard::new();
-            download.await?
-        };
-        project(result).await
-    })
-    .await
-}
-
-fn map_sync_result<T, F>(result: Result<T, AppError>, on_error: F) -> Result<T, String>
-where
-    F: FnOnce(&AppError),
-{
-    match result {
-        Ok(value) => Ok(value),
-        Err(err) => {
-            on_error(&err);
-            Err(err.to_string())
-        }
-    }
 }
 
 #[tauri::command]
@@ -195,7 +122,6 @@ mod tests {
         map_sync_result, persist_sync_error, require_enabled_s3_settings,
         resolve_secret_for_request, run_download_with_s3_lock, run_with_s3_lock, s3_sync_mutex,
     };
-    use crate::error::AppError;
     use crate::settings::{AppSettings, S3SyncSettings};
     use serial_test::serial;
     use std::sync::atomic::{AtomicBool, Ordering};

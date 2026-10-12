@@ -381,6 +381,16 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         );
         table.insert("get_usage_first_date", get_usage_first_date as Handler);
 
+        // ---- S3 同步 ----
+        table.insert("s3_test_connection", s3_test_connection as Handler);
+        table.insert("s3_sync_upload", s3_sync_upload as Handler);
+        table.insert("s3_sync_download", s3_sync_download as Handler);
+        table.insert("s3_sync_save_settings", s3_sync_save_settings as Handler);
+        table.insert(
+            "s3_sync_fetch_remote_info",
+            s3_sync_fetch_remote_info as Handler,
+        );
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -2319,6 +2329,141 @@ fn webdav_sync_fetch_remote_info(_context: Arc<Context>, _args: Value) -> Handle
     Box::pin(async move {
         let settings = crate::services::webdav_flow::require_enabled_settings()?;
         let info = crate::services::webdav_sync::fetch_remote_info(&settings)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(info.unwrap_or_else(|| serde_json::json!({ "empty": true })))
+    })
+}
+
+// ============================================================================
+// S3 同步
+//
+// 与上面的 WebDAV 一组同构：流程胶水在 `services::s3_flow`，真正做网络 IO 的
+// 部分在 `services::s3_sync`，全局同步互斥锁也在后者——两个恢复同时跑会把文件
+// 写成半新半旧，所以它只该有一处定义，这里只是去取。
+// ============================================================================
+
+fn s3_test_connection(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            settings: crate::settings::S3SyncSettings,
+            preserve_empty_secret: Option<bool>,
+        }
+        let Args {
+            settings,
+            preserve_empty_secret,
+        } = parse(args)?;
+
+        // 留空的 secret 有两种意思：没改过 / 清空。按桌面命令的默认走「没改过」。
+        let preserve_empty = preserve_empty_secret.unwrap_or(true);
+        let resolved = crate::services::s3_flow::resolve_secret_for_request(
+            settings,
+            crate::settings::get_s3_sync_settings(),
+            preserve_empty,
+        );
+        crate::services::s3_sync::check_connection(&resolved)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({ "success": true, "message": "S3 connection ok" }))
+    })
+}
+
+fn s3_sync_upload(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let db = state.db.clone();
+        let mut settings = crate::services::s3_flow::require_enabled_settings()?;
+
+        let result = crate::services::s3_flow::run_with_lock(crate::services::s3_sync::upload(
+            &db,
+            &mut settings,
+        ))
+        .await;
+        let value = crate::services::s3_flow::map_sync_result(result, |error| {
+            crate::services::s3_flow::persist_sync_error(&mut settings, error, "manual")
+        })?;
+        serializable(value)
+    })
+}
+
+fn s3_sync_download(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let db = state.db.clone();
+        let app_state_for_sync = state.clone();
+        let mut settings = crate::services::s3_flow::require_enabled_settings()?;
+
+        // 下载与投影同持一把锁，理由与 WebDAV 那组相同。
+        let sync_result = crate::services::s3_flow::run_download_with_lock(
+            crate::services::s3_sync::download(&db, &mut settings),
+            |result| async move {
+                let post_sync_result = crate::host::spawn_blocking(move || {
+                    crate::services::sync_support::run_post_import_sync(&app_state_for_sync)
+                })
+                .await
+                .map_err(|e| e.to_string());
+                Ok((result, post_sync_result))
+            },
+        )
+        .await;
+        let (mut result, post_sync_result) =
+            crate::services::s3_flow::map_sync_result(sync_result, |error| {
+                crate::services::s3_flow::persist_sync_error(&mut settings, error, "manual")
+            })?;
+
+        // 投影是尽力而为：快照恢复已经成功了，失败只作为警告附在结果上。
+        let warning =
+            crate::services::sync_support::post_sync_warning_from_result(post_sync_result);
+        if let Some(message) = warning.as_ref() {
+            log::warn!("[S3] post-download sync warning: {message}");
+        }
+        result = crate::services::sync_support::attach_warning(result, warning);
+        serializable(result)
+    })
+}
+
+fn s3_sync_save_settings(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            settings: crate::settings::S3SyncSettings,
+            secret_touched: Option<bool>,
+        }
+        let Args {
+            settings,
+            secret_touched,
+        } = parse(args)?;
+
+        let secret_touched = secret_touched.unwrap_or(false);
+        let existing = crate::settings::get_s3_sync_settings();
+        let mut sync_settings = crate::services::s3_flow::resolve_secret_for_request(
+            settings,
+            existing.clone(),
+            !secret_touched,
+        );
+
+        // 保留前端不管理的字段（同步状态由服务端写）
+        if let Some(existing_settings) = existing {
+            sync_settings.status = existing_settings.status;
+        }
+
+        sync_settings.normalize();
+        sync_settings
+            .validate()
+            .map_err(|error| error.to_string())?;
+        crate::settings::set_s3_sync_settings(Some(sync_settings))
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({ "success": true }))
+    })
+}
+
+fn s3_sync_fetch_remote_info(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let settings = crate::services::s3_flow::require_enabled_settings()?;
+        let info = crate::services::s3_sync::fetch_remote_info(&settings)
             .await
             .map_err(|error| error.to_string())?;
         Ok(info.unwrap_or_else(|| serde_json::json!({ "empty": true })))
