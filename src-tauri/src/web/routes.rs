@@ -325,6 +325,18 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("delete_env_vars", delete_env_vars as Handler);
         table.insert("restore_env_backup", restore_env_backup as Handler);
 
+        // ---- Pi 状态 / 用量脚本 / 用量首日 ----
+        table.insert("get_pi_current_state", get_pi_current_state as Handler);
+        table.insert(
+            "update_pi_provider_usage_script",
+            update_pi_provider_usage_script as Handler,
+        );
+        table.insert(
+            "get_pi_session_discovery",
+            get_pi_session_discovery as Handler,
+        );
+        table.insert("get_usage_first_date", get_usage_first_date as Handler);
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -1790,6 +1802,75 @@ fn restore_env_backup(_context: Arc<Context>, args: Value) -> HandlerFuture {
         let Args { backup_path } = parse(args)?;
         crate::services::env_manager::restore_from_backup(backup_path)?;
         Ok(Value::Bool(true))
+    })
+}
+
+// ============================================================================
+// Pi（agent）状态 / 用量脚本 / 用量首日
+//
+// 命令体都是一跳委托到 `services::pi_state`、`ProviderService` 与 db，原样搬。
+// `get_usage_first_date` 的桌面版用 `run_db_query` 包一层阻塞查询，这里直接用
+// 本文件的 `blocking` 做同一件事。
+// ============================================================================
+
+fn get_pi_current_state(context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let state = context.require_state()?;
+        let current = crate::services::pi_state::PiStateService::current(&state)
+            .map_err(|e| e.to_string())?;
+        serializable(current)
+    })
+}
+
+fn update_pi_provider_usage_script(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            id: String,
+            usage_script: crate::provider::UsageScript,
+        }
+        let Args { id, usage_script } = parse(args)?;
+        let state = context.require_state()?;
+        let saved = ProviderService::update_pi_usage_script(&state, &id, usage_script)
+            .map_err(|error| error.to_string())?;
+        serializable(saved)
+    })
+}
+
+fn get_pi_session_discovery(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(
+        async move { serializable(crate::session_manager::providers::pi::session_discovery()) },
+    )
+}
+
+fn get_usage_first_date(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            app_type: Option<String>,
+            provider_name: Option<String>,
+            model: Option<String>,
+        }
+        let Args {
+            app_type,
+            provider_name,
+            model,
+        } = parse(args)?;
+        let state = context.require_state()?;
+        blocking(move || {
+            state
+                .db
+                .get_first_usage_date(
+                    app_type.as_deref(),
+                    provider_name.as_deref(),
+                    model.as_deref(),
+                )
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .and_then(serializable)
     })
 }
 
