@@ -325,6 +325,10 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("delete_env_vars", delete_env_vars as Handler);
         table.insert("restore_env_backup", restore_env_backup as Handler);
 
+        // ---- 备份位置 ----
+        table.insert("list_backup_locations", list_backup_locations as Handler);
+        table.insert("delete_backup_location", delete_backup_location as Handler);
+
         // ---- Codex 会话压缩 / 过期提示 / 日志 ----
         table.insert(
             "get_codex_session_compression",
@@ -1956,6 +1960,38 @@ fn acknowledge_codex_stale_clients(_context: Arc<Context>, _args: Value) -> Hand
 fn reveal_app_log_file(_context: Arc<Context>, _args: Value) -> HandlerFuture {
     Box::pin(async move {
         Err("Web 模式下请在服务器上直接打开 <配置目录>/logs/cc-switch.log".to_string())
+    })
+}
+
+// ============================================================================
+// 备份位置（各处备份的目录与占用）
+//
+// 与前面几组同理：命令体是「解析 → 调 `services::backup_storage`」，且两次都是
+// 同步 IO，桌面版就丢在阻塞线程池里，这里照办。`reveal_backup_location` 走
+// `tauri_plugin_opener` 在文件管理器里定位目录，web 模式做不到（服务端没法替
+// **用户**弹窗口），与 `reveal_app_log_file` 同一处置。
+// ============================================================================
+
+/// 列出本机各类备份的位置与大小。
+fn list_backup_locations(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    // 目录扫描是同步 IO；`deferred` 要 `Result`，而 `list_locations` 直接返回
+    // Vec，包一层 `Ok` —— 它不失败，只是可能返回空表。
+    deferred(|| Ok(crate::services::backup_storage::list_locations()))
+}
+
+/// 删除一类备份（按类别 id），返回释放的字节数。
+fn delete_backup_location(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            id: String,
+        }
+        let Args { id } = parse(args)?;
+        blocking(move || {
+            crate::services::backup_storage::delete_location(&id).map_err(|error| error.to_string())
+        })
+        .await
+        .and_then(serializable)
     })
 }
 
