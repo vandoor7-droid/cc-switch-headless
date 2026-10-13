@@ -11,6 +11,7 @@ pub mod failover;
 pub mod global_proxy;
 pub mod import_export;
 pub mod managed_auth;
+pub mod managed_auth_ops;
 pub mod mcp;
 pub mod model_fetch;
 pub mod model_pricing;

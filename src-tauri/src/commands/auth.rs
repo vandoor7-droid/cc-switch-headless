@@ -265,7 +265,11 @@ pub async fn auth_remove_account(
                 .map_err(|e| e.to_string())
         }
         AUTH_PROVIDER_CODEX_OAUTH => {
-            remove_codex_oauth_account_with_switch_lock(app_state.inner(), &account_id).await
+            crate::services::managed_auth_ops::remove_codex_oauth_account_with_switch_lock(
+                app_state.inner(),
+                &account_id,
+            )
+            .await
         }
         AUTH_PROVIDER_XAI_OAUTH => {
             let auth_manager = xai_state.0.write().await;
@@ -277,32 +281,6 @@ pub async fn auth_remove_account(
         _ => unreachable!(),
     }
 }
-
-pub(crate) async fn remove_codex_oauth_account_with_switch_lock(
-    app_state: &AppState,
-    account_id: &str,
-) -> Result<(), String> {
-    // Serialize Auth Center credential deletion with managed provider
-    // add/update/switch/hot-switch. Otherwise a switch that already preflighted
-    // a bundle could recreate auth.json after removal.
-    let _switch_guard = app_state
-        .proxy_service
-        .lock_switch_for_app(AppType::Codex.as_str())
-        .await;
-    app_state
-        .codex_oauth_manager
-        .remove_account(account_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    app_state
-        .db
-        .unbind_codex_managed_accounts(&[account_id.to_string()])
-        .map_err(|error| {
-            format!("账号已删除，但 Codex 供应商解绑失败；请编辑供应商重新选择账号或切换供应商: {error}")
-        })?;
-    Ok(())
-}
-
 #[tauri::command(rename_all = "camelCase")]
 pub async fn auth_set_default_account(
     auth_provider: String,
@@ -351,40 +329,16 @@ pub async fn auth_logout(
             let auth_manager = copilot_state.0.write().await;
             auth_manager.clear_auth().await.map_err(|e| e.to_string())
         }
-        AUTH_PROVIDER_CODEX_OAUTH => logout_codex_oauth_with_switch_lock(app_state.inner()).await,
+        AUTH_PROVIDER_CODEX_OAUTH => {
+            crate::services::managed_auth_ops::logout_codex_oauth_with_switch_lock(
+                app_state.inner(),
+            )
+            .await
+        }
         AUTH_PROVIDER_XAI_OAUTH => {
             let auth_manager = xai_state.0.write().await;
             auth_manager.clear_auth().await.map_err(|e| e.to_string())
         }
         _ => unreachable!(),
     }
-}
-
-pub(crate) async fn logout_codex_oauth_with_switch_lock(
-    app_state: &AppState,
-) -> Result<(), String> {
-    let _switch_guard = app_state
-        .proxy_service
-        .lock_switch_for_app(AppType::Codex.as_str())
-        .await;
-    // Only this device's accounts: rows synced from another device stay bound there.
-    let removed: Vec<String> = app_state
-        .codex_oauth_manager
-        .list_accounts()
-        .await
-        .into_iter()
-        .map(|account| account.id)
-        .collect();
-    app_state
-        .codex_oauth_manager
-        .clear_auth()
-        .await
-        .map_err(|error| error.to_string())?;
-    app_state
-        .db
-        .unbind_codex_managed_accounts(&removed)
-        .map_err(|error| {
-            format!("托管账号已登出，但 Codex 供应商解绑失败；请编辑供应商重新选择账号或切换供应商: {error}")
-        })?;
-    Ok(())
 }

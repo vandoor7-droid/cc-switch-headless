@@ -3429,12 +3429,14 @@ wire_api = "responses"
                 ProviderService::switch(state, AppType::Codex, &current.id).unwrap();
                 if logout_all {
                     tauri::async_runtime::block_on(
-                        crate::commands::logout_codex_oauth_with_switch_lock(state),
+                        crate::services::managed_auth_ops::logout_codex_oauth_with_switch_lock(
+                            state,
+                        ),
                     )
                     .unwrap();
                 } else {
                     tauri::async_runtime::block_on(
-                        crate::commands::remove_codex_oauth_account_with_switch_lock(
+                        crate::services::managed_auth_ops::remove_codex_oauth_account_with_switch_lock(
                             state, "acct-old",
                         ),
                     )
@@ -3544,7 +3546,9 @@ wire_api = "responses"
                     )
                     .unwrap();
                 let error = tauri::async_runtime::block_on(
-                    crate::commands::remove_codex_oauth_account_with_switch_lock(state, "acct-old"),
+                    crate::services::managed_auth_ops::remove_codex_oauth_account_with_switch_lock(
+                        state, "acct-old",
+                    ),
                 )
                 .unwrap_err();
                 assert!(error.contains("账号已删除") && error.contains("解绑失败"));
@@ -3765,7 +3769,7 @@ wire_api = "responses"
                 scope.spawn(|| {
                     started_tx.send(()).expect("signal removal start");
                     let result = tauri::async_runtime::block_on(
-                        crate::commands::remove_codex_oauth_account_with_switch_lock(
+                        crate::services::managed_auth_ops::remove_codex_oauth_account_with_switch_lock(
                             state,
                             "acct-managed",
                         ),
@@ -3829,7 +3833,9 @@ wire_api = "responses"
                 scope.spawn(|| {
                     started_tx.send(()).expect("signal logout start");
                     let result = tauri::async_runtime::block_on(
-                        crate::commands::logout_codex_oauth_with_switch_lock(state),
+                        crate::services::managed_auth_ops::logout_codex_oauth_with_switch_lock(
+                            state,
+                        ),
                     );
                     done_tx.send(result).expect("send logout result");
                 });

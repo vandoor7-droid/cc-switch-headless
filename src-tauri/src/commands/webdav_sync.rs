@@ -127,6 +127,7 @@ mod tests {
         resolve_password_for_request, run_download_with_webdav_lock, run_with_webdav_lock,
         webdav_sync_mutex,
     };
+    use crate::error::AppError;
     use crate::settings::{AppSettings, WebDavSyncSettings};
     use serial_test::serial;
     use std::sync::atomic::{AtomicBool, Ordering};

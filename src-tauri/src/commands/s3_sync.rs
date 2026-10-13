@@ -122,6 +122,7 @@ mod tests {
         map_sync_result, persist_sync_error, require_enabled_s3_settings,
         resolve_secret_for_request, run_download_with_s3_lock, run_with_s3_lock, s3_sync_mutex,
     };
+    use crate::error::AppError;
     use crate::settings::{AppSettings, S3SyncSettings};
     use serial_test::serial;
     use std::sync::atomic::{AtomicBool, Ordering};

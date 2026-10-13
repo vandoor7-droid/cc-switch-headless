@@ -404,6 +404,16 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("get_codex_oauth_quota", get_codex_oauth_quota as Handler);
         table.insert("get_codex_oauth_models", get_codex_oauth_models as Handler);
 
+        // ---- 托管账号管理 ----
+        table.insert("auth_get_status", auth_get_status as Handler);
+        table.insert("auth_list_accounts", auth_list_accounts as Handler);
+        table.insert(
+            "auth_set_default_account",
+            auth_set_default_account as Handler,
+        );
+        table.insert("auth_remove_account", auth_remove_account as Handler);
+        table.insert("auth_logout", auth_logout as Handler);
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -2658,6 +2668,113 @@ fn get_codex_oauth_models(_context: Arc<Context>, args: Value) -> HandlerFuture 
         let models =
             crate::services::codex_oauth_queries::list_models(&manager, account_id).await?;
         serializable(models)
+    })
+}
+
+// ============================================================================
+// 托管账号管理：状态 / 账号列表 / 删账号 / 设默认 / 注销
+//
+// 操作实现在 `services::managed_auth_ops`，桌面命令与这里共用同一份。三个
+// provider 的差异都集中在 Codex 的切换锁上（见该模块文件头），那边已经处理好。
+//
+// 管理器从 `proxy::oauth_registry` 取，不从 Tauri 的 `.manage()` 容器拿——
+// 后者只在桌面构建里存在；`web/state.rs` 启动时注册的是同一批实例。
+// ============================================================================
+
+/// 把 registry 里的三个管理器收成一份，缺哪个就在用到时报错。
+fn managers() -> crate::services::managed_auth_ops::Managers {
+    crate::services::managed_auth_ops::Managers {
+        copilot: crate::proxy::oauth_registry::copilot(),
+        codex: crate::proxy::oauth_registry::codex(),
+        xai: crate::proxy::oauth_registry::xai(),
+    }
+}
+
+fn auth_get_status(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            auth_provider: String,
+        }
+        let Args { auth_provider } = parse(args)?;
+        let status =
+            crate::services::managed_auth_ops::get_status(&managers(), &auth_provider).await?;
+        serializable(status)
+    })
+}
+
+fn auth_list_accounts(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            auth_provider: String,
+        }
+        let Args { auth_provider } = parse(args)?;
+        let accounts =
+            crate::services::managed_auth_ops::list_accounts(&managers(), &auth_provider).await?;
+        serializable(accounts)
+    })
+}
+
+fn auth_set_default_account(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            auth_provider: String,
+            account_id: String,
+        }
+        let Args {
+            auth_provider,
+            account_id,
+        } = parse(args)?;
+        crate::services::managed_auth_ops::set_default_account(
+            &managers(),
+            &auth_provider,
+            &account_id,
+        )
+        .await?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn auth_remove_account(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            auth_provider: String,
+            account_id: String,
+        }
+        let Args {
+            auth_provider,
+            account_id,
+        } = parse(args)?;
+        let state = context.require_state()?;
+        crate::services::managed_auth_ops::remove_account(
+            &state,
+            &managers(),
+            &auth_provider,
+            &account_id,
+        )
+        .await?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn auth_logout(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            auth_provider: String,
+        }
+        let Args { auth_provider } = parse(args)?;
+        let state = context.require_state()?;
+        crate::services::managed_auth_ops::logout(&state, &managers(), &auth_provider).await?;
+        Ok(Value::Bool(true))
     })
 }
 
