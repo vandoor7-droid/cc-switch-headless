@@ -5,107 +5,16 @@ use crate::commands::codex_oauth::CodexOAuthState;
 use crate::commands::copilot::CopilotAuthState;
 use crate::commands::xai_oauth::XaiOAuthState;
 use crate::proxy::providers::codex_oauth_auth::CodexOAuthError;
-use crate::proxy::providers::copilot_auth::{
-    CopilotAuthError, GitHubAccount, GitHubDeviceCodeResponse,
-};
-use crate::proxy::providers::xai_oauth_auth::{XaiOAuthAccount, XaiOAuthError};
+use crate::proxy::providers::copilot_auth::CopilotAuthError;
+use crate::proxy::providers::xai_oauth_auth::XaiOAuthError;
 use crate::store::AppState;
-
-const AUTH_PROVIDER_GITHUB_COPILOT: &str = "github_copilot";
-const AUTH_PROVIDER_CODEX_OAUTH: &str = "codex_oauth";
-const AUTH_PROVIDER_XAI_OAUTH: &str = "xai_oauth";
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ManagedAuthAccount {
-    pub id: String,
-    pub provider: String,
-    pub login: String,
-    pub avatar_url: Option<String>,
-    pub authenticated_at: i64,
-    pub is_default: bool,
-    pub github_domain: String,
-    /// Codex 专用：旧账号缺少写入原生 Codex auth.json 所需的 id_token。
-    pub reauth_required: bool,
-    /// xAI 专用：refresh token 已失效，账号不可再用于请求。
-    pub requires_reauth: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ManagedAuthStatus {
-    pub provider: String,
-    pub authenticated: bool,
-    pub default_account_id: Option<String>,
-    pub migration_error: Option<String>,
-    pub accounts: Vec<ManagedAuthAccount>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ManagedAuthDeviceCodeResponse {
-    pub provider: String,
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    pub expires_in: u64,
-    pub interval: u64,
-}
-
-fn ensure_auth_provider(auth_provider: &str) -> Result<&'static str, String> {
-    match auth_provider {
-        AUTH_PROVIDER_GITHUB_COPILOT => Ok(AUTH_PROVIDER_GITHUB_COPILOT),
-        AUTH_PROVIDER_CODEX_OAUTH => Ok(AUTH_PROVIDER_CODEX_OAUTH),
-        AUTH_PROVIDER_XAI_OAUTH => Ok(AUTH_PROVIDER_XAI_OAUTH),
-        _ => Err(format!("Unsupported auth provider: {auth_provider}")),
-    }
-}
-
-fn map_account(
-    provider: &str,
-    account: GitHubAccount,
-    default_account_id: Option<&str>,
-) -> ManagedAuthAccount {
-    ManagedAuthAccount {
-        is_default: default_account_id == Some(account.id.as_str()),
-        reauth_required: account.reauth_required,
-        requires_reauth: false,
-        id: account.id,
-        provider: provider.to_string(),
-        login: account.login,
-        avatar_url: account.avatar_url,
-        authenticated_at: account.authenticated_at,
-        github_domain: account.github_domain,
-    }
-}
-
-fn map_xai_account(
-    account: XaiOAuthAccount,
-    default_account_id: Option<&str>,
-) -> ManagedAuthAccount {
-    ManagedAuthAccount {
-        is_default: default_account_id == Some(account.id.as_str()),
-        id: account.id,
-        provider: AUTH_PROVIDER_XAI_OAUTH.to_string(),
-        login: account.login,
-        avatar_url: account.avatar_url,
-        authenticated_at: account.authenticated_at,
-        github_domain: account.github_domain,
-        reauth_required: false,
-        requires_reauth: account.requires_reauth,
-    }
-}
-
-fn map_device_code_response(
-    provider: &str,
-    response: GitHubDeviceCodeResponse,
-) -> ManagedAuthDeviceCodeResponse {
-    ManagedAuthDeviceCodeResponse {
-        provider: provider.to_string(),
-        device_code: response.device_code,
-        user_code: response.user_code,
-        verification_uri: response.verification_uri,
-        expires_in: response.expires_in,
-        interval: response.interval,
-    }
-}
+// 形状与映射在 `services::managed_auth`，服务端的 `web/routes.rs` 共用同一份：
+// 它不在 desktop 门控里，两边的序列化形状因此不可能漂。
+pub use crate::services::managed_auth::{
+    ensure_auth_provider, map_account, map_device_code_response, map_xai_account,
+    ManagedAuthAccount, ManagedAuthDeviceCodeResponse, ManagedAuthStatus,
+    AUTH_PROVIDER_CODEX_OAUTH, AUTH_PROVIDER_GITHUB_COPILOT, AUTH_PROVIDER_XAI_OAUTH,
+};
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn auth_start_login(
