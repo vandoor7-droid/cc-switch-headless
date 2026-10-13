@@ -414,6 +414,10 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("auth_remove_account", auth_remove_account as Handler);
         table.insert("auth_logout", auth_logout as Handler);
 
+        table.insert("auth_start_login", auth_start_login as Handler);
+        table.insert("auth_poll_for_account", auth_poll_for_account as Handler);
+        table.insert("auth_cancel_login", auth_cancel_login as Handler);
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -2775,6 +2779,87 @@ fn auth_logout(context: Arc<Context>, args: Value) -> HandlerFuture {
         let state = context.require_state()?;
         crate::services::managed_auth_ops::logout(&state, &managers(), &auth_provider).await?;
         Ok(Value::Bool(true))
+    })
+}
+
+// ============================================================================
+// 托管账号：设备码登录
+//
+// 与上面的管理五条同一模块（`services::managed_auth_ops`）。要点：**轮询时
+// 「还没授权」是 `None` 而不是错误**——否则登录流程在用户还没扫码时就红了。
+// ============================================================================
+
+fn auth_start_login(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            auth_provider: String,
+            github_domain: Option<String>,
+            target_account_id: Option<String>,
+        }
+        let Args {
+            auth_provider,
+            github_domain,
+            target_account_id,
+        } = parse(args)?;
+        let response = crate::services::managed_auth_ops::start_login(
+            &managers(),
+            &auth_provider,
+            github_domain.as_deref(),
+            target_account_id.as_deref(),
+        )
+        .await?;
+        serializable(response)
+    })
+}
+
+fn auth_poll_for_account(context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            auth_provider: String,
+            device_code: String,
+            github_domain: Option<String>,
+        }
+        let Args {
+            auth_provider,
+            device_code,
+            github_domain,
+        } = parse(args)?;
+        let state = context.require_state()?;
+        let account = crate::services::managed_auth_ops::poll_for_account(
+            &state,
+            &managers(),
+            &auth_provider,
+            &device_code,
+            github_domain.as_deref(),
+        )
+        .await?;
+        serializable(account)
+    })
+}
+
+fn auth_cancel_login(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            auth_provider: String,
+            device_code: String,
+        }
+        let Args {
+            auth_provider,
+            device_code,
+        } = parse(args)?;
+        let cancelled = crate::services::managed_auth_ops::cancel_login(
+            &managers(),
+            &auth_provider,
+            &device_code,
+        )
+        .await?;
+        serializable(cancelled)
     })
 }
 

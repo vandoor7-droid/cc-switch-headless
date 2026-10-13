@@ -336,3 +336,181 @@ pub async fn logout_codex_oauth_with_switch_lock(state: &AppState) -> Result<(),
         })?;
     Ok(())
 }
+
+// ============================================================================
+// 设备码登录
+//
+// 三条命令共用一个细节：**轮询时「还没授权」不是错误**。三种管理器各自的
+// `AuthorizationPending` 都映射成 `Ok(None)`，前端据此继续轮询；只有真正的
+// 失败才变成 Err。把它当成错误会让登录流程在用户还没扫码时就红掉。
+//
+// Codex 的 `poll_for_token` 还要一个 `before_commit` 钩子：提交 token 前先拿
+// 切换锁，避免与托管供应商的增删改撞在一起。桌面命令传的是同一个闭包。
+// ============================================================================
+
+/// 发起设备码登录。
+///
+/// 只有 Codex 支持「指定账号重新登录」；另外两家传了 `target_account_id`
+/// 就明确拒绝，而不是悄悄忽略。
+pub async fn start_login(
+    managers: &Managers,
+    auth_provider: &str,
+    github_domain: Option<&str>,
+    target_account_id: Option<&str>,
+) -> Result<crate::services::managed_auth::ManagedAuthDeviceCodeResponse, String> {
+    use crate::services::managed_auth::{
+        ensure_auth_provider, map_device_code_response, AUTH_PROVIDER_CODEX_OAUTH,
+        AUTH_PROVIDER_GITHUB_COPILOT, AUTH_PROVIDER_XAI_OAUTH,
+    };
+    let auth_provider = ensure_auth_provider(auth_provider)?;
+    match auth_provider {
+        AUTH_PROVIDER_GITHUB_COPILOT => {
+            if target_account_id.is_some() {
+                return Err("Targeted re-authentication is only supported for Codex OAuth".into());
+            }
+            let auth_manager = managers
+                .copilot
+                .as_ref()
+                .ok_or_else(|| missing(auth_provider))?
+                .read()
+                .await;
+            let response = auth_manager
+                .start_device_flow(github_domain)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(map_device_code_response(auth_provider, response))
+        }
+        AUTH_PROVIDER_CODEX_OAUTH => {
+            let auth_manager = managers
+                .codex
+                .as_ref()
+                .ok_or_else(|| missing(auth_provider))?;
+            let response = auth_manager
+                .start_device_flow(target_account_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(map_device_code_response(auth_provider, response))
+        }
+        AUTH_PROVIDER_XAI_OAUTH => {
+            if target_account_id.is_some() {
+                return Err("Targeted re-authentication is only supported for Codex OAuth".into());
+            }
+            let auth_manager = managers
+                .xai
+                .as_ref()
+                .ok_or_else(|| missing(auth_provider))?
+                .read()
+                .await;
+            let response = auth_manager
+                .start_device_flow()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(map_device_code_response(auth_provider, response))
+        }
+        other => Err(format!("Unsupported auth provider: {other}")),
+    }
+}
+
+/// 轮询设备码登录；还没授权时返回 `None`，见文件头。
+pub async fn poll_for_account(
+    state: &AppState,
+    managers: &Managers,
+    auth_provider: &str,
+    device_code: &str,
+    github_domain: Option<&str>,
+) -> Result<Option<crate::services::managed_auth::ManagedAuthAccount>, String> {
+    use crate::services::managed_auth::{
+        ensure_auth_provider, map_account, map_xai_account, AUTH_PROVIDER_CODEX_OAUTH,
+        AUTH_PROVIDER_GITHUB_COPILOT, AUTH_PROVIDER_XAI_OAUTH,
+    };
+    let auth_provider = ensure_auth_provider(auth_provider)?;
+    match auth_provider {
+        AUTH_PROVIDER_GITHUB_COPILOT => {
+            let auth_manager = managers
+                .copilot
+                .as_ref()
+                .ok_or_else(|| missing(auth_provider))?
+                .write()
+                .await;
+            match auth_manager
+                .poll_for_token(device_code, github_domain)
+                .await
+            {
+                Ok(account) => {
+                    let default_account_id = auth_manager.get_status().await.default_account_id;
+                    Ok(account.map(|account| {
+                        map_account(auth_provider, account, default_account_id.as_deref())
+                    }))
+                }
+                Err(
+                    crate::proxy::providers::copilot_auth::CopilotAuthError::AuthorizationPending,
+                ) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        AUTH_PROVIDER_CODEX_OAUTH => {
+            let auth_manager = managers
+                .codex
+                .as_ref()
+                .ok_or_else(|| missing(auth_provider))?;
+            match auth_manager
+                .poll_for_token(device_code, || async {
+                    state
+                        .proxy_service
+                        .lock_switch_for_app(AppType::Codex.as_str())
+                        .await
+                })
+                .await
+            {
+                Ok(account) => {
+                    let default_account_id = auth_manager.get_status().await.default_account_id;
+                    Ok(account.map(|account| {
+                        map_account(auth_provider, account, default_account_id.as_deref())
+                    }))
+                }
+                Err(crate::proxy::providers::codex_oauth_auth::CodexOAuthError::AuthorizationPending) => {
+                    Ok(None)
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        AUTH_PROVIDER_XAI_OAUTH => {
+            let auth_manager = managers
+                .xai
+                .as_ref()
+                .ok_or_else(|| missing(auth_provider))?
+                .write()
+                .await;
+            match auth_manager.poll_for_token(device_code).await {
+                Ok(account) => {
+                    let default_account_id = auth_manager.get_status().await.default_account_id;
+                    Ok(account
+                        .map(|account| map_xai_account(account, default_account_id.as_deref())))
+                }
+                Err(
+                    crate::proxy::providers::xai_oauth_auth::XaiOAuthError::AuthorizationPending,
+                ) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        other => Err(format!("Unsupported auth provider: {other}")),
+    }
+}
+
+/// 取消设备码登录。只有 Codex 支持，其余明确拒绝而不是静默成功。
+pub async fn cancel_login(
+    managers: &Managers,
+    auth_provider: &str,
+    device_code: &str,
+) -> Result<bool, String> {
+    use crate::services::managed_auth::{ensure_auth_provider, AUTH_PROVIDER_CODEX_OAUTH};
+    let auth_provider = ensure_auth_provider(auth_provider)?;
+    if auth_provider != AUTH_PROVIDER_CODEX_OAUTH {
+        return Err("Login cancellation is only supported for Codex OAuth".to_string());
+    }
+    let auth_manager = managers
+        .codex
+        .as_ref()
+        .ok_or_else(|| missing(auth_provider))?;
+    Ok(auth_manager.cancel_device_flow(device_code).await)
+}
