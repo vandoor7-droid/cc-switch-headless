@@ -418,6 +418,47 @@ fn dispatch_table() -> &'static HashMap<&'static str, Handler> {
         table.insert("auth_poll_for_account", auth_poll_for_account as Handler);
         table.insert("auth_cancel_login", auth_cancel_login as Handler);
 
+        // ---- Copilot 托管账号（旧专用 API）----
+        table.insert(
+            "copilot_start_device_flow",
+            copilot_start_device_flow as Handler,
+        );
+        table.insert("copilot_poll_for_auth", copilot_poll_for_auth as Handler);
+        table.insert(
+            "copilot_poll_for_account",
+            copilot_poll_for_account as Handler,
+        );
+        table.insert("copilot_list_accounts", copilot_list_accounts as Handler);
+        table.insert("copilot_remove_account", copilot_remove_account as Handler);
+        table.insert(
+            "copilot_set_default_account",
+            copilot_set_default_account as Handler,
+        );
+        table.insert(
+            "copilot_get_auth_status",
+            copilot_get_auth_status as Handler,
+        );
+        table.insert(
+            "copilot_is_authenticated",
+            copilot_is_authenticated as Handler,
+        );
+        table.insert("copilot_logout", copilot_logout as Handler);
+        table.insert("copilot_get_token", copilot_get_token as Handler);
+        table.insert(
+            "copilot_get_token_for_account",
+            copilot_get_token_for_account as Handler,
+        );
+        table.insert("copilot_get_models", copilot_get_models as Handler);
+        table.insert(
+            "copilot_get_models_for_account",
+            copilot_get_models_for_account as Handler,
+        );
+        table.insert("copilot_get_usage", copilot_get_usage as Handler);
+        table.insert(
+            "copilot_get_usage_for_account",
+            copilot_get_usage_for_account as Handler,
+        );
+
         // ---- 导入导出与数据库备份 ----
         table.insert("export_config_to_file", export_config_to_file as Handler);
         table.insert(
@@ -2860,6 +2901,282 @@ fn auth_cancel_login(_context: Arc<Context>, args: Value) -> HandlerFuture {
         )
         .await?;
         serializable(cancelled)
+    })
+}
+
+// ============================================================================
+// Copilot 托管账号（旧的 Copilot 专用 API）
+//
+// 与 `auth_*` 那组并存：`auth_*` 是三家通用的「托管账号」面，这批是 Copilot 专用
+// 的那套（更早，也更细——token / 模型 / 用量都能按账号取）。前端两套都在用。
+//
+// 15 条全部是 `CopilotAuthManager` 的一行封装，逻辑本就在管理器里，无需抽取。
+// 管理器从 `proxy::oauth_registry` 取（不是 Tauri 的 `.manage()` 容器）。
+//
+// 注意 `poll_for_auth` 与 `poll_for_account` 的语义差别：前者只回答「授权了没」
+// （true/false），后者带回新账号；两者都把「还在等」当成 `None`/`false`，**不是
+// 错误**——否则用户还没扫码登录就红了。
+// ============================================================================
+
+fn copilot() -> Result<
+    std::sync::Arc<tokio::sync::RwLock<crate::proxy::providers::copilot_auth::CopilotAuthManager>>,
+    String,
+> {
+    crate::proxy::oauth_registry::copilot()
+        .ok_or_else(|| "No Copilot auth manager registered".to_string())
+}
+
+fn copilot_start_device_flow(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            github_domain: Option<String>,
+        }
+        let Args { github_domain } = parse(args)?;
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        let response = auth_manager
+            .start_device_flow(github_domain.as_deref())
+            .await
+            .map_err(|error| error.to_string())?;
+        serializable(response)
+    })
+}
+
+/// 向后兼容的轮询：只回答「授权了没」。
+fn copilot_poll_for_auth(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            device_code: String,
+            github_domain: Option<String>,
+        }
+        let Args {
+            device_code,
+            github_domain,
+        } = parse(args)?;
+        let manager = copilot()?;
+        let auth_manager = manager.write().await;
+        match auth_manager
+            .poll_for_token(&device_code, github_domain.as_deref())
+            .await
+        {
+            Ok(Some(_account)) => {
+                log::info!("[CopilotAuth] 用户已授权");
+                Ok(Value::Bool(true))
+            }
+            Ok(None) => Ok(Value::Bool(false)),
+            Err(crate::proxy::providers::copilot_auth::CopilotAuthError::AuthorizationPending) => {
+                Ok(Value::Bool(false))
+            }
+            Err(error) => {
+                log::error!("[CopilotAuth] 轮询失败: {error}");
+                Err(error.to_string())
+            }
+        }
+    })
+}
+
+/// 多账号版本的轮询：带回新添加的账号，未授权时 `null`。
+fn copilot_poll_for_account(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            device_code: String,
+            github_domain: Option<String>,
+        }
+        let Args {
+            device_code,
+            github_domain,
+        } = parse(args)?;
+        let manager = copilot()?;
+        let auth_manager = manager.write().await;
+        match auth_manager
+            .poll_for_token(&device_code, github_domain.as_deref())
+            .await
+        {
+            Ok(account) => serializable(account),
+            Err(crate::proxy::providers::copilot_auth::CopilotAuthError::AuthorizationPending) => {
+                Ok(Value::Null)
+            }
+            Err(error) => {
+                log::error!("[CopilotAuth] 轮询失败: {error}");
+                Err(error.to_string())
+            }
+        }
+    })
+}
+
+fn copilot_list_accounts(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        let accounts = auth_manager.list_accounts().await;
+        serializable(accounts)
+    })
+}
+
+fn copilot_remove_account(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            account_id: String,
+        }
+        let Args { account_id } = parse(args)?;
+        let manager = copilot()?;
+        let auth_manager = manager.write().await;
+        auth_manager
+            .remove_account(&account_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn copilot_set_default_account(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            account_id: String,
+        }
+        let Args { account_id } = parse(args)?;
+        let manager = copilot()?;
+        let auth_manager = manager.write().await;
+        auth_manager
+            .set_default_account(&account_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Value::Bool(true))
+    })
+}
+
+fn copilot_get_auth_status(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        serializable(auth_manager.get_status().await)
+    })
+}
+
+fn copilot_is_authenticated(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        serializable(auth_manager.is_authenticated().await)
+    })
+}
+
+fn copilot_logout(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let manager = copilot()?;
+        let auth_manager = manager.write().await;
+        auth_manager
+            .clear_auth()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Value::Bool(true))
+    })
+}
+
+/// 向后兼容：取第一个账号的有效 token（代理请求用）。
+fn copilot_get_token(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        serializable(
+            auth_manager
+                .get_valid_token()
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    })
+}
+
+fn copilot_get_token_for_account(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            account_id: String,
+        }
+        let Args { account_id } = parse(args)?;
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        serializable(
+            auth_manager
+                .get_valid_token_for_account(&account_id)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    })
+}
+
+fn copilot_get_models(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        serializable(
+            auth_manager
+                .fetch_models()
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    })
+}
+
+fn copilot_get_models_for_account(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            account_id: String,
+        }
+        let Args { account_id } = parse(args)?;
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        serializable(
+            auth_manager
+                .fetch_models_for_account(&account_id)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    })
+}
+
+fn copilot_get_usage(_context: Arc<Context>, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        serializable(
+            auth_manager
+                .fetch_usage()
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    })
+}
+
+fn copilot_get_usage_for_account(_context: Arc<Context>, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            account_id: String,
+        }
+        let Args { account_id } = parse(args)?;
+        let manager = copilot()?;
+        let auth_manager = manager.read().await;
+        serializable(
+            auth_manager
+                .fetch_usage_for_account(&account_id)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
     })
 }
 
